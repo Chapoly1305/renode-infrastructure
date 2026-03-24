@@ -1372,7 +1372,7 @@ namespace Antmicro.Renode.Core
         {
             foreach(var peripheral in peripherals)
             {
-                foreach(var gpio in peripheral.GetGPIOs().Select(x => x.Item2))
+                foreach(var gpio in peripheral.GetGPIOs().Select(x => x.Item2).Where(x => x != null))
                 {
                     var endpoints = gpio.Endpoints;
                     for(var i = 0; i < endpoints.Count; ++i)
@@ -1490,7 +1490,7 @@ namespace Antmicro.Renode.Core
                 // find all peripherials' GPIOs and check which one is connected to detachedPeripherial
                 foreach(var peripheral in registeredPeripherals.Children.Select(x => x.Value).Distinct())
                 {
-                    foreach(var gpio in peripheral.GetGPIOs().Select(x => x.Item2))
+                    foreach(var gpio in peripheral.GetGPIOs().Select(x => x.Item2).Where(x => x != null))
                     {
                         var endpoints = gpio.Endpoints;
                         for(var i = 0; i < endpoints.Count; ++i)

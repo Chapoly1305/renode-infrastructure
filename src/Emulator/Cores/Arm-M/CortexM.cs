@@ -826,6 +826,19 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        // PATCH: The public property "Nvic" is added here to assist in bus fault modeling.  
+        // When a peripheral model wants to trigger a busfault, it can stuff a value into
+        // the BFAR (bus fault address register) via the NVIC reference.
+        // If, some day in the future, renode implements real bus fault modeling, 
+        // this patch will no longer be needed.
+        public NVIC Nvic
+        {
+            get
+            {
+                return nvic;
+            }
+        }
+
         public override string[] AllLLVMTriples => new[] { "thumb" };
 
         // LLVM considers M4F to be the "base" M4, see https://reviews.llvm.org/D12692

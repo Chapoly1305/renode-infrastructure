@@ -1026,6 +1026,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
              * If there is an address here, it's always valid */
             Registers.SecureFaultAddress.Define(RegisterCollection)
                 .WithValueField(0, 32, FieldMode.Read, valueProviderCallback: _ => isNextAccessSecure ? cpu.SecureFaultAddress : 0, name: "Address");
+
+            // PATCH: added for modeling a bus fault.  For now a peripheral that wants to
+            // emulate a bus fault can stuff a value into this register, which is expected 
+            // to be useful to the bus fault handler. If real bus fault modeling is added 
+            // to renode, this patch will no longer be needed. The solution could potentially
+            // be different from this patch (for example storing the address inside the cpu 
+            // model instead).
+            Registers.BusFaultAddress.Define(RegisterCollection)
+                .WithValueField(0, 32, name: "BFAR");
         }
 
         private void DefineTightlyCoupledMemoryControlRegisters()

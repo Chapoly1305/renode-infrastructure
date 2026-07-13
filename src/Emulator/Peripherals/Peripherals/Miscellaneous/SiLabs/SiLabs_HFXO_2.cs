@@ -19,9 +19,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
 {
     public class SiLabs_HFXO_2 : SiLabsPeripheral, SiLabs_IHFXO
     {
-        public SiLabs_HFXO_2(Machine machine, uint startupDelayTicks) : base(machine)
+        public SiLabs_HFXO_2(Machine machine, uint startupDelayTicks, bool releaseFsmLockOnDisableOnDemand = false) : base(machine)
         {
             this.delayTicks = startupDelayTicks;
+            this.releaseFsmLockOnDisableOnDemand = releaseFsmLockOnDisableOnDemand;
 
             timer = new LimitTimer(machine.ClockSource, 32768, this, "hfxodelay", 0xFFFFFFFFUL, direction: Direction.Ascending,
                                    enabled: false, workMode: WorkMode.OneShot, eventEnabled: true, autoUpdate: true);
@@ -96,6 +97,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                         if (!value)
                         {
                             fsmLock.Value = true;
+                        }
+                        else if (releaseFsmLockOnDisableOnDemand)
+                        {
+                            // On parts without the MANUALOVERRIDE command (e.g. EFR32MG21),
+                            // setting DISONDEMAND releases the start-up FSM lock. Without this
+                            // the FSMLOCK-clear wait loop in CMU_HFXOInit() spins forever.
+                            // Opt-in (default false) so MG22 (which uses MANUALOVERRIDE to
+                            // clear FSMLOCK) is unaffected.
+                            fsmLock.Value = false;
                         }
                     }, name: "DISONDEMAND")
                     .WithTaggedFlag("KEEPWARM", 2)
@@ -201,6 +211,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
         private IFlagRegisterField disableOnDemand;
         private IFlagRegisterField forceEnable;
         private IFlagRegisterField fsmLock;
+        private readonly bool releaseFsmLockOnDisableOnDemand;
         private IFlagRegisterField locked;
         private IFlagRegisterField enabled;
         private readonly uint delayTicks;

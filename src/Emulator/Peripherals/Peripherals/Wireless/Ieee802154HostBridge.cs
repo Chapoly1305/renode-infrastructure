@@ -105,6 +105,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
                          n, BitConverter.ToString(learnedSync), Channel);
             }
 
+            // The bridge synthesizes MAC ACKs locally (see the ack-request handling below and in HostRxLoop),
+            // so a real ACK the device transmitted is redundant. Relaying it would only deliver a stray ACK
+            // to the host well after its ACK window -- drop it.
+            if(IsAckFrame(mpdu))
+            {
+                return;
+            }
+
             // The model mocks the FCS as 0x0000; OpenThread verifies CRC-16/KERMIT, so put a real FCS in.
             WriteFcs(mpdu);
 
@@ -114,7 +122,35 @@ namespace Antmicro.Renode.Peripherals.Wireless
                          mpdu.Length, Channel, BitConverter.ToString(mpdu));
             }
 
-            SendToHost(mpdu);
+            // FrameSent fires at the device's TX START, but a real receiver only holds the frame once it is
+            // fully on air. Estimate the on-air time (PHY frame length at the 802.15.4 O-QPSK rate of
+            // 32us/byte; the received frame omits the 4-byte preamble, so add it back).
+            var airTimeUs = (ulong)(frame.Length + PreambleBytes) * MicrosecondsPerByte;
+
+            if(IsUnicastAckRequest(mpdu))
+            {
+                // A unicast frame the device expects to be ACKed. Two things must be true or the MLE attach
+                // never completes:
+                //   * the ACK must land in the device's ~864us MAC ACK window -- the real host ACK can't
+                //     round-trip that fast across the virtual/real-time boundary (~10ms lag), so synthesize
+                //     it locally and deliver it after the device finishes transmitting (air time) + the
+                //     standard turnaround, i.e. right when the device starts listening for its ACK; and
+                //   * the ACK must arrive BEFORE the host's data reply. The device waits for the MAC ACK
+                //     before accepting a reply; if the (real-time) host's reply is injected first, the device
+                //     treats its frame as un-ACKed and retransmits instead of processing the reply. So deliver
+                //     the ACK and only THEN relay the frame to the host, chaining them in one action so the
+                //     host's reply is necessarily ordered after the ACK.
+                var sequenceNumber = mpdu[2];
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(airTimeUs + AckTurnaroundMicroseconds),
+                                       _ => { InjectToDevice(BuildAck(sequenceNumber)); SendToHost(mpdu); },
+                                       "ieee802154-ack-then-relay");
+            }
+            else
+            {
+                // Broadcast / no-ACK frame: just relay it, after the device finishes transmitting so the
+                // real-time host's reply isn't injected back while the half-duplex device is still on air.
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(airTimeUs), _ => SendToHost(mpdu), "ieee802154-relay-to-host");
+            }
         }
 
         // Find the sync-word length N (0..MaxSyncBytes) for which the PHR byte is self-consistent with the
@@ -140,8 +176,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
             return -1;
         }
 
-        // ---- Host -> device: an MPDU received from the host Thread air, injected onto the medium ------------
-        private void DeliverFromHost(byte[] mpdu)
+        // ---- Inject an MPDU onto the medium toward the device (host frames, and locally-synthesized ACKs) --
+        private void InjectToDevice(byte[] mpdu)
         {
             if(mpdu.Length < MinMpdu || mpdu.Length > MaxMpdu)
             {
@@ -167,12 +203,26 @@ namespace Antmicro.Renode.Peripherals.Wireless
                          mpdu.Length, Channel, BitConverter.ToString(mpdu));
             }
 
-            // Transmit onto the medium like the real radio: register in the shared InterferenceQueue BEFORE
-            // raising FrameSent (the receiver drops frames whose sender is absent there -- "TX was aborted"),
-            // then remove shortly after so the entry doesn't linger past the frame's air time.
-            InterferenceQueue.Add(this, RadioPhyId.Phy_802154_2_4GHz_OQPSK, Channel, 0, frame);
+            // Register in the shared InterferenceQueue BEFORE raising FrameSent (the receiver drops frames
+            // whose sender is absent there -- "TX was aborted") and keep the entry until the frame's air
+            // time elapses: the receiver validates the sender against the queue DURING RX, i.e. after
+            // FrameSent returns, so a synchronous removal would make it drop the frame. The queue holds a
+            // single entry per sender, so reference-count overlapping injections (e.g. a data frame and a
+            // synthesized ACK) rather than letting one removal clobber the other's still-in-flight entry.
+            if(inFlightInjections++ == 0)
+            {
+                InterferenceQueue.Add(this, RadioPhyId.Phy_802154_2_4GHz_OQPSK, Channel, 0, frame);
+            }
             FrameSent?.Invoke(this, frame);
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(FrameOnAirMicroseconds), _ => InterferenceQueueRemoveSafe(), "ieee802154-tx-done");
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(FrameOnAirMicroseconds), _ => EndInjection(), "ieee802154-tx-done");
+        }
+
+        private void EndInjection()
+        {
+            if(--inFlightInjections == 0)
+            {
+                InterferenceQueueRemoveSafe();
+            }
         }
 
         private void InterferenceQueueRemoveSafe()
@@ -277,10 +327,26 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     continue;
                 }
 
+                // The bridge synthesizes ACKs locally, so drop the host's real ACKs (they would otherwise
+                // reach the device as stray frames long after its ACK window).
+                if(IsAckFrame(mpdu))
+                {
+                    continue;
+                }
+
+                // If the host unicast a frame that requests an ACK, ACK it immediately from this RX thread --
+                // which runs in the host's real-time domain, so the host sees the ACK within microseconds.
+                // (The device's own real ACK would be delayed ~10ms by the virtual/real-time boundary and
+                // miss the host's ACK window.) Then deliver the actual frame to the emulated device.
+                if(IsUnicastAckRequest(mpdu))
+                {
+                    SendToHost(BuildAck(mpdu[2]));
+                }
+
                 // Marshal onto the emulation thread at the current virtual time (thread-safe; same mechanism
                 // the wireless medium uses to deliver inbound frames).
                 var vts = TimeDomainsManager.Instance.GetEffectiveVirtualTimeStamp();
-                machine.HandleTimeDomainEvent<byte[]>(DeliverFromHost, mpdu, vts);
+                machine.HandleTimeDomainEvent<byte[]>(InjectToDevice, mpdu, vts);
             }
         }
 
@@ -296,12 +362,44 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 var datagram = new byte[1 + mpdu.Length];
                 datagram[0] = (byte)Channel;
                 Array.Copy(mpdu, 0, datagram, 1, mpdu.Length);
-                s.SendTo(datagram, groupEndpoint);
+                // Called both from the emulation thread (relaying device frames) and the host RX thread
+                // (synthesizing prompt ACKs back to the host), so serialize the sends.
+                lock(txLock)
+                {
+                    s.SendTo(datagram, groupEndpoint);
+                }
             }
             catch(Exception e)
             {
                 this.Log(LogLevel.Noisy, "Ieee802154HostBridge: tx error: {0}", e.Message);
             }
+        }
+
+        // ---- Local MAC-ACK synthesis --------------------------------------------------------------------
+        // The device (virtual time) and the host (real time) can't meet each other's ~864us 802.15.4 ACK
+        // window across the UDP relay -- Renode aligns the two clocks only in coarse (~ms) steps. So the
+        // bridge generates the ACKs locally in each peer's own time domain and suppresses the (late) real
+        // ACKs, instead of relaying them. Device firmware stays stock; this is purely bridge behavior.
+
+        private static bool IsAckFrame(byte[] mpdu)
+        {
+            // 802.15.4 frame type (FCF bits 0-2) == 2 is an acknowledgement.
+            return mpdu.Length >= 1 && (mpdu[0] & 0x07) == 0x02;
+        }
+
+        private static bool IsUnicastAckRequest(byte[] mpdu)
+        {
+            // A data (1) or MAC-command (3) frame with the Ack Request bit (FCF bit 5, 0x20) set. Broadcast
+            // MLE frames carry AR=0, so they are naturally excluded (and need no ACK).
+            return mpdu.Length >= 3 && (mpdu[0] & 0x07) != 0x02 && (mpdu[0] & 0x20) != 0;
+        }
+
+        private static byte[] BuildAck(byte sequenceNumber)
+        {
+            // 802.15.4 Imm-Ack: FCF = 0x0002 (Ack frame, no addressing), the acked sequence number, FCS.
+            var ack = new byte[] { 0x02, 0x00, sequenceNumber, 0x00, 0x00 };
+            WriteFcs(ack);
+            return ack;
         }
 
         // ---- IEEE 802.15.4 FCS: CRC-16/KERMIT (reflected 0x8408, init 0x0000), low byte first --------------
@@ -343,12 +441,21 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private IPEndPoint groupEndpoint;
         private Thread rxThread;
         private byte[] learnedSync;
+        private readonly object txLock = new object();
+        private int inFlightInjections; // reference count for the single per-sender InterferenceQueue entry
 
         // 802.15.4: min MPDU = FC(2)+seq(1)+FCS(2) = 5; max PSDU = 127. Sync word is a few bytes.
         private const int MinMpdu = 5;
         private const int MaxMpdu = 127;
         private const int MaxSyncBytes = 8;
         private const int MinPhyFrame = MinMpdu + 1; // at least PHR + a minimal MPDU
-        private const ulong FrameOnAirMicroseconds = 400;
+        private const ulong FrameOnAirMicroseconds = 400; // keep the sender in the InterferenceQueue this long
+        // 802.15.4 aTurnaroundTime (12 symbols * 16us): the TX->RX turnaround after the device finishes
+        // transmitting, before it listens for the ACK.
+        private const ulong AckTurnaroundMicroseconds = 192;
+        // 802.15.4 2.4GHz O-QPSK PHY: 250 kbps = 32us/byte; SHR preamble is 4 bytes (not carried in the
+        // frame the bridge receives). Used to estimate the device's frame air time for ACK timing.
+        private const ulong MicrosecondsPerByte = 32;
+        private const int PreambleBytes = 4;
     }
 }

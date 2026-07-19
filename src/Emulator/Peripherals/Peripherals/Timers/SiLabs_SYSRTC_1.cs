@@ -276,44 +276,38 @@ namespace Antmicro.Renode.Peripherals.Timers
 
             timer.Enabled = false;
             uint limit = 0xFFFFFFFF;
+            uint shortestDistance = uint.MaxValue;
 
             // Compare interrupt fires "on the next cycle", therefore we just set 
             // the timer to the +1 value and fire the interrupt right away when
             // we hit the limit.
 
-            if(group0Compare0Enable.Value
-                && currentValue < (group0Compare0Value.Value + 1)
-                && (group0Compare0Value.Value + 1) < limit)
-            {
-                limit = (uint)group0Compare0Value.Value + 1;
-            }
-
-            if(group0Compare1Enable.Value
-                && currentValue < (group0Compare1Value.Value + 1)
-                && (group0Compare1Value.Value + 1) < limit)
-            {
-                limit = (uint)group0Compare1Value.Value + 1;
-            }
-
-            if(group1Compare0Enable.Value
-                && currentValue < (group1Compare0Value.Value + 1)
-                && (group1Compare0Value.Value + 1) < limit)
-            {
-                limit = (uint)group1Compare0Value.Value + 1;
-            }
-
-            if(group1Compare1Enable.Value
-                && currentValue < (group1Compare1Value.Value + 1)
-                && (group1Compare1Value.Value + 1) < limit)
-            {
-                limit = (uint)group1Compare1Value.Value + 1;
-            }
+            TryUpdateLimit((uint)group0Compare0Value.Value, group0Compare0Enable.Value, currentValue, ref limit, ref shortestDistance);
+            TryUpdateLimit((uint)group0Compare1Value.Value, group0Compare1Enable.Value, currentValue, ref limit, ref shortestDistance);
+            TryUpdateLimit((uint)group1Compare0Value.Value, group1Compare0Enable.Value, currentValue, ref limit, ref shortestDistance);
+            TryUpdateLimit((uint)group1Compare1Value.Value, group1Compare1Enable.Value, currentValue, ref limit, ref shortestDistance);
 
             // RENODE-65: add support for capture functionality
 
             timer.Limit = limit;
-            timer.Enabled = true;
             timer.Value = currentValue;
+            timer.Enabled = true;
+        }
+
+        private static void TryUpdateLimit(uint compareValue, bool compareEnabled, uint currentValue, ref uint limit, ref uint shortestDistance)
+        {
+            if(!compareEnabled)
+            {
+                return;
+            }
+
+            var compareLimit = unchecked(compareValue + 1);
+            var distance = unchecked(compareLimit - currentValue);
+            if(distance < shortestDistance)
+            {
+                shortestDistance = distance;
+                limit = compareLimit;
+            }
         }
 
         private void WriteWSTATIC()

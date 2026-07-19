@@ -140,6 +140,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             automaticGainControlRegistersCollection = BuildAutomaticGainControlRegistersCollection();
             hostMailboxRegistersCollection = BuildHostMailboxRegistersCollection();
             radioMailboxRegistersCollection = BuildRadioMailboxRegistersCollection();
+            InitializeUnhandledRegisterResetValues();
 
             InterferenceQueue.InterferenceQueueChanged += InteferenceQueueChangedCallback;
         }
@@ -1446,7 +1447,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
                 if(!registersCollection.TryWrite(internal_offset, internal_value))
                 {
-                    this.Log(LogLevel.Warning, "Unhandled write to {0} at offset 0x{1:X} ({2}), value 0x{3:X}.", regionName, internal_offset, Enum.Format(typeof(T), internal_offset, "G"), internal_value);
+                    SetShadowRegisterValue(regionName, internal_offset, internal_value);
+                    this.Log(LogLevel.Debug, "Shadowed write to {0} at offset 0x{1:X} ({2}), value 0x{3:X}.",
+                             regionName, internal_offset, Enum.Format(typeof(T), internal_offset, "G"), internal_value);
                     return;
                 }
             });
@@ -1489,7 +1492,15 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
             if(!registersCollection.TryRead(internal_offset, out result))
             {
-                if(!internal_read)
+                if(TryGetShadowRegisterValue(regionName, internal_offset, out result))
+                {
+                    if(!internal_read)
+                    {
+                        this.Log(LogLevel.Debug, "{0}: Shadowed read from {1} at offset 0x{2:X} ({3}), returned 0x{4:X}",
+                                 this.GetTime(), regionName, internal_offset, Enum.Format(typeof(T), internal_offset, "G"), result);
+                    }
+                }
+                else if(!internal_read)
                 {
                     this.Log(LogLevel.Warning, "Unhandled read from {0} at offset 0x{1:X} ({2}).", regionName, internal_offset, Enum.Format(typeof(T), internal_offset, "G"));
                 }
@@ -1514,6 +1525,67 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var registerValue = Read<T>(registersCollection, regionName, offset - byteOffset, true);
             var result = (byte)((registerValue >> byteOffset*8) & 0xFF);
             return result;
+        }
+
+        private static string NormalizeRegionName(string regionName)
+        {
+            return regionName.Replace("_NS", string.Empty);
+        }
+
+        private void SetShadowRegisterValue(string regionName, long offset, uint value)
+        {
+            var normalizedRegionName = NormalizeRegionName(regionName);
+            if(!shadowRegisters.TryGetValue(normalizedRegionName, out var registers))
+            {
+                registers = new Dictionary<long, uint>();
+                shadowRegisters[normalizedRegionName] = registers;
+            }
+            registers[offset] = value;
+        }
+
+        private bool TryGetShadowRegisterValue(string regionName, long offset, out uint value)
+        {
+            var normalizedRegionName = NormalizeRegionName(regionName);
+            if(shadowRegisters.TryGetValue(normalizedRegionName, out var registers)
+               && registers.TryGetValue(offset, out value))
+            {
+                return true;
+            }
+
+            value = 0;
+            return false;
+        }
+
+        private void InitializeUnhandledRegisterResetValues()
+        {
+            // These reset values match xG24 RM register definitions and are needed by RF calibration code.
+            SetShadowRegisterValue("Synthesizer (SYNTH)", 0x2C, 0x00000020);
+            SetShadowRegisterValue("Synthesizer (SYNTH)", 0x8C, 0x00000000);
+            SetShadowRegisterValue("Synthesizer (SYNTH)", 0x90, 0x00000000);
+            SetShadowRegisterValue("Synthesizer (SYNTH)", 0xA8, 0x00000000);
+            SetShadowRegisterValue("Synthesizer (SYNTH)", 0xAC, 0x00000000);
+
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x98, 0x00000000);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0xEC, 0x11512C6C);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x178, 0x1FE00410);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x180, 0x00000000);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x184, 0x00000000);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x190, 0x00000000);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x194, 0x00000000);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x198, 0x00000000);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x19C, 0x00000000);
+            SetShadowRegisterValue("Radio Controller (RAC)", 0x7FC, 0x000000FF);
+
+            SetShadowRegisterValue("Automatic Gain Control (AGC)", 0x28, 0x0000610A);
+
+            SetShadowRegisterValue("Modulator And Demodulator (MODEM)", 0xDC, 0x009F9F9F);
+            SetShadowRegisterValue("Modulator And Demodulator (MODEM)", 0x110, 0x00000030);
+            SetShadowRegisterValue("Modulator And Demodulator (MODEM)", 0x118, 0x00000000);
+            SetShadowRegisterValue("Modulator And Demodulator (MODEM)", 0x13C, 0x00000000);
+            SetShadowRegisterValue("Modulator And Demodulator (MODEM)", 0x168, 0x00FA53E8);
+            SetShadowRegisterValue("Modulator And Demodulator (MODEM)", 0x1C0, 0x003C0000);
+            SetShadowRegisterValue("Modulator And Demodulator (MODEM)", 0x278, 0x00000000);
+            SetShadowRegisterValue("Modulator And Demodulator (MODEM)", 0x27C, 0x00000000);
         }
 
         private DoubleWordRegisterCollection BuildHostMailboxRegistersCollection()
@@ -3367,14 +3439,24 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 return;
             }
 
+            // Real hardware advances the base counter one tick at a time and a compare channel asserts
+            // its match the moment BASECNT equals CC.BASE. This lightweight model advances the counter in
+            // one bulk step (`increment` PRECNT overflows at once), so a strict `==` on the endpoint would
+            // MISS any compare target the counter jumped over -- which made a periodic advertising compare
+            // fire only ONCE (after the first event the bulk endpoint overshoots the target every batch).
+            // Fire on the swept RANGE instead. PROTIMER_ComputeTimerLimit clamps `increment` to at most
+            // (baseCounterTop - baseCounterValue), so the counter never wraps within a single increment and
+            // the swept-through values are exactly (previousBaseCounterValue, PROTIMER_baseCounterValue].
+            var previousBaseCounterValue = PROTIMER_baseCounterValue;
             PROTIMER_baseCounterValue += (ushort)increment;
 
             for(var i = 0; i < PROTIMER_NumberOfCaptureCompareChannels; ++i)
             {
+                var baseTarget = PROTIMER_captureCompareChannel[i].BaseValue.Value;
                 var triggered = PROTIMER_captureCompareChannel[i].Enable.Value
                     && PROTIMER_captureCompareChannel[i].BaseMatchEnable.Value
                     && PROTIMER_captureCompareChannel[i].Mode.Value == PROTIMER_CaptureCompareMode.Compare
-                    && PROTIMER_baseCounterValue == PROTIMER_captureCompareChannel[i].BaseValue.Value;
+                    && previousBaseCounterValue < baseTarget && baseTarget <= PROTIMER_baseCounterValue;
 
                 if(triggered)
                 {
@@ -3423,14 +3505,20 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 return;
             }
 
+            // Fire wrap-compare matches on the swept RANGE, not just the bulk endpoint -- same reasoning as
+            // PROTIMER_IncrementBaseCounter (ComputeTimerLimit clamps `increment` to at most
+            // (wrapCounterTop - wrapCounterValue), so the swept values are
+            // (previousWrapCounterValue, PROTIMER_wrapCounterValue] with no wrap inside one increment).
+            var previousWrapCounterValue = PROTIMER_wrapCounterValue;
             PROTIMER_wrapCounterValue += increment;
 
             for(var i = 0; i < PROTIMER_NumberOfCaptureCompareChannels; ++i)
             {
+                var wrapTarget = PROTIMER_captureCompareChannel[i].WrapValue.Value;
                 var triggered = PROTIMER_captureCompareChannel[i].Enable.Value
                     && PROTIMER_captureCompareChannel[i].WrapMatchEnable.Value
                     && PROTIMER_captureCompareChannel[i].Mode.Value == PROTIMER_CaptureCompareMode.Compare
-                    && PROTIMER_wrapCounterValue == PROTIMER_captureCompareChannel[i].WrapValue.Value;
+                    && previousWrapCounterValue < wrapTarget && wrapTarget <= PROTIMER_wrapCounterValue;
 
                 if(triggered)
                 {
@@ -3720,7 +3808,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
             if(PROTIMER_txSetEvent1.Value == PROTIMER_Event.Disabled
                 && PROTIMER_txSetEvent2.Value == PROTIMER_Event.Disabled)
             {
-                PROTIMER_rxRequestState = PROTIMER_TxRxRequestState.Idle;
+                // Was PROTIMER_rxRequestState (copy-paste bug): this method updates the TX request state.
+                PROTIMER_txRequestState = PROTIMER_TxRxRequestState.Idle;
             }
             else if(PROTIMER_rxSetEvent1.Value == PROTIMER_Event.Always
                      && PROTIMER_rxSetEvent2.Value == PROTIMER_Event.Always)
@@ -4778,6 +4867,17 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         private void RAC_SeqTimerHandleLimitReached()
         {
+            // Fallback path: if Tx2Rx IRQ clear is missed by software, force progress to RxSearch
+            // on STIMER expiry to avoid getting stuck in Tx2Rx forever.
+            if(RAC_currentRadioState == RAC_RadioState.Tx2Rx && RAC_seqStateTx2RxInterrupt.Value)
+            {
+                RAC_seqStateTx2RxInterrupt.Value = false;
+                UpdateInterrupts();
+                this.Log(LogLevel.Noisy, "RAC: forcing Tx2RxIrqCleared on STIMER expiry fallback.");
+                RAC_UpdateRadioStateMachine(RAC_RadioStateMachineSignal.Tx2RxIrqCleared);
+                return;
+            }
+
             // Handle 16-bit wrap around
             if(seqTimer.Limit == 0xFFFF)
             {
@@ -4825,8 +4925,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
             seqTimer.Divider = RAC_seqTimerPrescaler.Value + 1;
             seqTimer.Limit = limit;
-            seqTimer.Enabled = true;
             seqTimer.Value = startValue;
+            seqTimer.Enabled = true;
         }
 
         private void RAC_ClearOngoingTx()
@@ -5970,6 +6070,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private readonly DoubleWordRegisterCollection radioMailboxRegistersCollection;
         private readonly DoubleWordRegisterCollection hostMailboxRegistersCollection;
         private readonly DoubleWordRegisterCollection synthesizerRegistersCollection;
+        private readonly Dictionary<string, Dictionary<long, uint>> shadowRegisters = new Dictionary<string, Dictionary<long, uint>>();
         private readonly IValueRegisterField[] RAC_scratch = new IValueRegisterField[RAC_NumberOfScratchRegisters];
         private readonly IValueRegisterField[] RAC_seqStorage = new IValueRegisterField[RAC_NumberOfSequencerStorageRegisters];
         private readonly IFlagRegisterField[] RFMAILBOX_messageInterruptEnable = new IFlagRegisterField[MailboxMessageNumber];

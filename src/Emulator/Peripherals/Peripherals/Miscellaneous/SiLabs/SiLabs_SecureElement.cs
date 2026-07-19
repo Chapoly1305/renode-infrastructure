@@ -24,6 +24,7 @@ using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Macs;
 using Org.BouncyCastle.Crypto.Modes;
 using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Crypto.Signers;
 using Org.BouncyCastle.Math;
 using Org.BouncyCastle.Math.EC;
 using Org.BouncyCastle.Security;
@@ -82,15 +83,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
         public void TxHeaderSetCallback(uint header)
         {
             // Setting the TX header starts a new "transaction".
-            // The TX header as per HOST code, appears to be simply the number of 
-            // bytes (multiple of 4) that constitute the message.
+            // The TX header as per HOST code is the number of bytes (multiple of 4)
+            // that constitute the message.
             // At minimum a message contains:
             // - The header itself
             // - The command ID
             // - Address in memory of command data input
             // - Address in memory of command data output
             // - Zero or more parameters
-            wordsLeftToBeReceived = header / 4;
+            var wordsInHeader = DecodeWordsFromTxHeader(header);
+            wordsLeftToBeReceived = wordsInHeader;
         }
 
         public uint GetDefaultErrorStatus()
@@ -117,16 +119,31 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             {
                 parent.Log(LogLevel.Error, "ProcessCommand(): Queue is EMPTY!");
                 WriteResponse(ResponseCode.InvalidParameter, commandHandle);
+                txFifo.Clear();
+                wordsLeftToBeReceived = 0;
+                return;
             }
 
             uint header = txFifo.Dequeue();
-            // First 2 bytes of the header is the number of bytes in the message (header included)
-            uint wordsCount = (header & 0xFFFF)/4;
+            uint wordsCount = DecodeWordsFromTxHeader(header);
+
+            var minimumWords = series3 ? 5U : 4U;
+            if(wordsCount < minimumWords)
+            {
+                parent.Log(LogLevel.Error, "ProcessCommand(): Invalid wordsCount={0} (minimum={1})", wordsCount, minimumWords);
+                WriteResponse(ResponseCode.InvalidParameter, commandHandle);
+                txFifo.Clear();
+                wordsLeftToBeReceived = 0;
+                return;
+            }
 
             if(txFifo.Count < wordsCount - 1)
             {
                 parent.Log(LogLevel.Error, "ProcessCommand(): Not enough words FifoSize={0}, expectedWords={1}", txFifo.Count, wordsCount - 1);
                 WriteResponse(ResponseCode.InvalidParameter, commandHandle);
+                txFifo.Clear();
+                wordsLeftToBeReceived = 0;
+                return;
             }
 
             if(series3)
@@ -140,6 +157,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             uint inputDmaDescriptorPtr = txFifo.Dequeue();
             uint outputDmaDescriptorPtr = txFifo.Dequeue();
             uint commandParamsCount = wordsCount - (series3 ? 5U : 4U);
+            if(commandParamsCount > 13)
+            {
+                parent.Log(LogLevel.Error, "ProcessCommand(): Unsupported commandParamsCount={0}", commandParamsCount);
+                WriteResponse(ResponseCode.InvalidParameter, commandHandle);
+                txFifo.Clear();
+                wordsLeftToBeReceived = 0;
+                return;
+            }
             uint[] commandParams = new uint[13];
             for(var i = 0; i < commandParamsCount; i++)
             {
@@ -148,8 +173,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
 
             parent.Log(LogLevel.Info, "ProcessCommand(): command ID={0} command Options=0x{1:X} command params count={2}", commandId, commandOptions, commandParamsCount);
 
-            ResponseCode responseCode;
+            ResponseCode responseCode = ResponseCode.InternalError;
 
+            try
+            {
             switch(commandId)
             {
             case CommandId.CreateKey:
@@ -157,6 +184,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 break;
             case CommandId.ReadPublicKey:
                 responseCode = HandleReadPublicKeyCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount);
+                break;
+            case CommandId.SignatureSign:
+                responseCode = HandleSignatureSignCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount, commandOptions);
+                break;
+            case CommandId.SignatureVerify:
+                responseCode = HandleSignatureVerifyCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount, commandOptions);
                 break;
             case CommandId.ImportKey:
                 responseCode = HandleImportKeyCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount);
@@ -174,6 +207,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             case CommandId.HashFinish:
                 responseCode = HandleHashUpdateOrFinishCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount, commandOptions, (commandId == CommandId.HashFinish));
                 break;
+            case CommandId.HashHmac:
+                responseCode = HandleHashHmacCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount, commandOptions);
+                break;
             case CommandId.AesEncrypt:
             case CommandId.AesDecrypt:
                 responseCode = HandleAesEncryptOrDecryptCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount, commandOptions, (commandId == CommandId.AesEncrypt));
@@ -182,10 +218,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 responseCode = HandleAesCmacCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount);
                 break;
             case CommandId.AesCcmEncrypt:
-                responseCode = HandleAesCcmEncryptCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount);
+                responseCode = HandleCcmMultipartCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount, commandOptions, false);
                 break;
             case CommandId.AesCcmDecrypt:
-                responseCode = HandleAesCcmDecryptCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount);
+                responseCode = HandleCcmMultipartCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount, commandOptions, true);
                 break;
             case CommandId.AesGcmEncrypt:
                 responseCode = HandleAesGcmEncryptCommand(inputDmaDescriptorPtr, outputDmaDescriptorPtr, commandParams, commandParamsCount, commandOptions);
@@ -234,6 +270,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 parent.Log(LogLevel.Error, "ProcessCommand(): Command ID 0x{0:X} not handled!", (uint)commandId);
                 break;
             }
+            }
+            catch(Exception ex)
+            {
+                // A handler bug must not abort the whole emulator; fail the SE command instead.
+                parent.Log(LogLevel.Error, "ProcessCommand(): exception handling command {0}: {1}", commandId, ex.Message);
+                responseCode = ResponseCode.InternalError;
+            }
 
             if(responseCode != ResponseCode.Ok)
             {
@@ -241,6 +284,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             }
 
             WriteResponse(responseCode, commandHandle);
+        }
+
+        private uint DecodeWordsFromTxHeader(uint header)
+        {
+            // SEMAILBOX_1 carries SIZE in the low 16 bits.
+            // SEMAILBOX_2 uses full-width header field for size in bytes.
+            var sizeInBytes = series3 ? header : (header & 0xFFFF);
+            if((sizeInBytes & 0x3) != 0)
+            {
+                parent.Log(LogLevel.Warning, "DecodeWordsFromTxHeader(): unaligned size in header=0x{0:X8}", header);
+            }
+            return sizeInBytes / 4;
         }
 
         private void WriteResponse(ResponseCode code, uint commandHandle)
@@ -706,10 +761,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 return ResponseCode.Abort;
             }
 
-            // For SHA256 we support loading the state
+            // For SHA256 the running hash state (H1..H8) is carried across HASH_UPDATE/FINISH via the
+            // input-state descriptor (desc0), NOT the payload. Load it so multi-block hashes continue
+            // correctly (loading `payload` here was a bug that made every streaming hash restart, which
+            // corrupts e.g. the Matter SPAKE2+ transcript). For FINISH also restore the running byte
+            // count (commandParams[1]) so the final length padding covers the whole message.
             if (hashMode == ShaMode.Sha256)
-            {  
-                ((SiLabs_Sha256Digest)hashEngine).SetState(payload);
+            {
+                ((SiLabs_Sha256Digest)hashEngine).SetState(inputState);
+                if (doFinish)
+                {
+                    // `counter` is the TOTAL message length; BlockUpdate below will add this final
+                    // block's length, so seed the running count with the prior bytes only.
+                    ((SiLabs_Sha256Digest)hashEngine).SetByteCount((long)counter - (long)inputPayloadLength);
+                }
             }
 
             hashEngine.BlockUpdate(payload, 0, (int)inputPayloadLength);
@@ -723,12 +788,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 }
                 byte[] output = new byte[outputLength];
                 hashEngine.DoFinal(output, 0);
-                
+
                 if (hashMode != ShaMode.Sha256)
                 {
                     currentHashEngine = null;
                 }
-                
                 parent.Log(LogLevel.Noisy, "Digest=[{0}]", BitConverter.ToString(output));
                 WriteToRam(output, 0, outputDescriptorPtr, outputLength);
             }
@@ -749,6 +813,93 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                     WriteToRam(outputState, 0, outputDescriptorPtr, outputLength);
                 }
             }
+            return ResponseCode.Ok;
+        }
+
+        private ResponseCode HandleHashHmacCommand(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount, uint commandOptions)
+        {
+            // HMAC (SE command 0x302). Mirrors the AES_CMAC descriptor layout (auth desc, key desc,
+            // message desc -> MAC output), but keyed by an arbitrary-length HMAC key and using the
+            // SHA engine selected in the command options. Required by Matter SPAKE2+ (key-confirmation
+            // MACs cA/cB and HKDF) -- without it the device's PASE MAC is wrong and commissioning fails.
+            if(commandParamsCount != 2)
+            {
+                parent.Log(LogLevel.Error, "HMAC: invalid parameter count {0} (expected 2)", commandParamsCount);
+                return ResponseCode.Abort;
+            }
+
+            ShaMode hashMode = (ShaMode)((commandOptions & 0xF00) >> 8);
+
+            KeyMode keyMode;
+            KeyType keyType;
+            KeyRestriction keyRestriction;
+            uint keyIndex;
+            UnpackKeyMetadata(commandParams[0], out keyIndex, out keyType, out keyMode, out keyRestriction);
+            uint messageSize = commandParams[1];
+            parent.Log(LogLevel.Noisy, "HMAC: hashMode={0} keyMode={1} keyType={2} keyIndex={3} messageSize={4}",
+                     hashMode, keyMode, keyType, keyIndex, messageSize);
+
+            DmaTransferOptions transferOptions;
+            uint nextDescriptorPtr;
+
+            // First input DMA descriptor is the authorization data (empty for plaintext keys).
+            uint authPtr;
+            uint authLength;
+            UnpackDmaDescriptor(inputDma, out authPtr, out authLength, out transferOptions, out nextDescriptorPtr, machine);
+            parent.Log(LogLevel.Noisy, "HMAC: INPUT0(auth): authPtr=0x{0:X} authLength={1} nextDescriptorPtr=0x{2:X}",
+                     authPtr, authLength, nextDescriptorPtr);
+
+            // Second input DMA descriptor contains the key.
+            uint keyPtr;
+            uint keyLength;
+            UnpackDmaDescriptor(nextDescriptorPtr, out keyPtr, out keyLength, out transferOptions, out nextDescriptorPtr, machine);
+            parent.Log(LogLevel.Noisy, "HMAC: INPUT1(key): keyPtr=0x{0:X} keyLength={1} nextDescriptorPtr=0x{2:X}",
+                     keyPtr, keyLength, nextDescriptorPtr);
+
+            // Retrieve the HMAC key. Unlike AES, HMAC keys are arbitrary length, so for a plaintext
+            // (Unprotected) key read exactly the descriptor's length rather than assuming 16 bytes.
+            byte[] key;
+            if(keyMode == KeyMode.Unprotected)
+            {
+                key = new byte[keyLength];
+                FetchFromRam(keyPtr, key, 0, keyLength);
+            }
+            else
+            {
+                key = CheckAndRetrieveKey(keyType, keyMode, keyIndex, keyPtr);
+            }
+            parent.Log(LogLevel.Noisy, "HMAC: key=[{0}]", BitConverter.ToString(key));
+
+            // Third input DMA descriptor contains the message to authenticate.
+            uint messagePtr;
+            uint messageLength;
+            UnpackDmaDescriptor(nextDescriptorPtr, out messagePtr, out messageLength, out transferOptions, out nextDescriptorPtr, machine);
+            byte[] message = new byte[messageLength];
+            FetchFromRam(messagePtr, message, 0, messageLength);
+            parent.Log(LogLevel.Noisy, "HMAC: message({0})=[{1}]", messageLength, BitConverter.ToString(message));
+
+            // First output DMA descriptor receives the MAC.
+            uint macPtr;
+            uint macLength;
+            UnpackDmaDescriptor(outputDma, out macPtr, out macLength, out transferOptions, out nextDescriptorPtr, machine);
+
+            IDigest digest = CreateHashEngine(hashMode);
+            if(digest == null)
+            {
+                parent.Log(LogLevel.Error, "HMAC: invalid hash mode {0}", hashMode);
+                return ResponseCode.InvalidParameter;
+            }
+
+            HMac hmac = new HMac(digest);
+            hmac.Init(new KeyParameter(key));
+            hmac.BlockUpdate(message, 0, (int)messageLength);
+            byte[] fullMac = new byte[hmac.GetMacSize()];
+            hmac.DoFinal(fullMac, 0);
+
+            // The caller may request a truncated MAC (macLength <= digest size).
+            byte[] outputData = new byte[macLength];
+            Array.Copy(fullMac, 0, outputData, 0, (int)Math.Min(macLength, (uint)fullMac.Length));
+            WriteToRam(outputData, 0, macPtr, macLength);
             return ResponseCode.Ok;
         }
 
@@ -905,6 +1056,225 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             return ResponseCode.InvalidParameter;
         }
 
+        // Running state for one CCM multipart operation (see ccmContexts).
+        private class CcmMultipartContext
+        {
+            public byte[] Key;
+            public byte[] Nonce;
+            public byte[] Aad;
+            public uint TagLen;
+            public bool IsDecrypt;
+            public long Counter;                        // CCM CTR counter; data starts at A_1 (counter == 1)
+            public List<byte> Data = new List<byte>();  // ciphertext (decrypt) / plaintext (encrypt) accumulated for the MAC
+        }
+
+        // CCM CTR-mode keystream over `data[0..len)` -> `output[outOff..]`, advancing ctx.Counter one block at a
+        // time. Counter block A_i = [flags=L-1 | nonce | i] (i in the last L=15-nonceLen bytes, big-endian).
+        private void CcmCtrProcess(CcmMultipartContext ctx, byte[] data, int len, byte[] output, int outOff)
+        {
+            int L = 15 - ctx.Nonce.Length;
+            var aes = new AesEngine();
+            aes.Init(true, new KeyParameter(ctx.Key));
+            byte[] a = new byte[16];
+            byte[] ks = new byte[16];
+            a[0] = (byte)(L - 1);
+            Array.Copy(ctx.Nonce, 0, a, 1, ctx.Nonce.Length);
+            int off = 0;
+            while(off < len)
+            {
+                long c = ctx.Counter;
+                for(int i = 0; i < L; i++) { a[15 - i] = (byte)(c & 0xFF); c >>= 8; }
+                aes.ProcessBlock(a, 0, ks, 0);
+                int blk = Math.Min(16, len - off);
+                for(int i = 0; i < blk; i++) { output[outOff + off + i] = (byte)(data[off + i] ^ ks[i]); }
+                off += blk;
+                ctx.Counter++;
+            }
+        }
+
+        // CCM is used by CHIP operational-message crypto via the SE multipart flow. Dispatch by the command
+        // options: 0x0001 starts, 0x0003 update, 0x0002 finish. Anything else falls back to the one-shot path.
+        private ResponseCode HandleCcmMultipartCommand(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount, uint commandOptions, bool isDecrypt)
+        {
+            switch(commandOptions & 0xF)
+            {
+            case 0x1:
+                return CcmMultipartStarts(inputDma, outputDma, commandParams, commandParamsCount, isDecrypt);
+            case 0x3:
+                return CcmMultipartUpdate(inputDma, outputDma, commandParams, commandParamsCount, isDecrypt);
+            case 0x2:
+                return CcmMultipartFinish(inputDma, outputDma, commandParams, commandParamsCount, isDecrypt);
+            default:
+                return isDecrypt
+                    ? HandleAesCcmDecryptCommand(inputDma, outputDma, commandParams, commandParamsCount)
+                    : HandleAesCcmEncryptCommand(inputDma, outputDma, commandParams, commandParamsCount);
+            }
+        }
+
+        // starts: params [0]=keyMeta [1]=(nonceSize<<16|tagSize) [2]=aadSize [3]=keyMeta2.
+        // inputs: auth, key, [len(4) only if total_len!=0], nonce, aad. output: 32B ctx-state buffer (= our key).
+        private ResponseCode CcmMultipartStarts(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount, bool isDecrypt)
+        {
+            if(commandParamsCount < 3)
+            {
+                parent.Log(LogLevel.Error, "CCM_MULTIPART_STARTS: invalid parameter count {0}", commandParamsCount);
+                return ResponseCode.Abort;
+            }
+            uint tagSize   = commandParams[1] & 0xFFFF;
+            uint nonceSize = (commandParams[1] >> 16) & 0xFFFF;
+
+            KeyMode keyMode; KeyType keyType; KeyRestriction keyRestriction; uint keyIndex;
+            UnpackKeyMetadata(commandParams[0], out keyIndex, out keyType, out keyMode, out keyRestriction);
+
+            DmaTransferOptions opt;
+            uint next = inputDma;
+            uint authPtr, authLen; UnpackDmaDescriptor(next, out authPtr, out authLen, out opt, out next, machine);
+            uint keyPtr, keyLen;   UnpackDmaDescriptor(next, out keyPtr, out keyLen, out opt, out next, machine);
+            byte[] key = CheckAndRetrieveKey(keyType, keyMode, keyIndex, keyPtr);
+
+            // The next descriptor is the 4-byte total-length word (present only if total_len != 0) or the nonce.
+            uint peekPtr, peekLen, afterPeek;
+            UnpackDmaDescriptor(next, out peekPtr, out peekLen, out opt, out afterPeek, machine);
+            uint noncePtr, nonceLen, afterNonce;
+            if(peekLen == 4)
+            {
+                UnpackDmaDescriptor(afterPeek, out noncePtr, out nonceLen, out opt, out afterNonce, machine);
+            }
+            else
+            {
+                noncePtr = peekPtr; nonceLen = peekLen; afterNonce = afterPeek;
+            }
+            byte[] nonce = new byte[nonceLen]; FetchFromRam(noncePtr, nonce, 0, nonceLen);
+            uint aadPtr, aadLen; UnpackDmaDescriptor(afterNonce, out aadPtr, out aadLen, out opt, out next, machine);
+            byte[] aad = new byte[aadLen]; FetchFromRam(aadPtr, aad, 0, aadLen);
+
+            // The single output descriptor is the running ctx-state buffer; its pointer is our per-op key.
+            uint ctxPtr, ctxLen; UnpackDmaDescriptor(outputDma, out ctxPtr, out ctxLen, out opt, out next, machine);
+
+            ccmContexts[ctxPtr] = new CcmMultipartContext
+            {
+                Key = key, Nonce = nonce, Aad = aad, TagLen = tagSize, IsDecrypt = isDecrypt, Counter = 1,
+            };
+            // The ctx buffer contents are opaque to the device (it only round-trips them); zero it.
+            WriteToRam(new byte[ctxLen], 0, ctxPtr, ctxLen);
+            parent.Log(LogLevel.Noisy, "CCM_MULTIPART_STARTS: ctx=0x{0:X} nonceLen={1} aadLen={2} tagLen={3} decrypt={4}",
+                     ctxPtr, nonceLen, aadLen, tagSize, isDecrypt);
+            return ResponseCode.Ok;
+        }
+
+        // update: params [0]=keyMeta [1]=chunkLen. inputs: auth, key, ctx-state(32), data-chunk.
+        // outputs: transformed-chunk, ctx-state(32).
+        private ResponseCode CcmMultipartUpdate(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount, bool isDecrypt)
+        {
+            DmaTransferOptions opt;
+            uint next = inputDma;
+            uint aPtr, aLen; UnpackDmaDescriptor(next, out aPtr, out aLen, out opt, out next, machine);       // auth
+            uint kPtr, kLen; UnpackDmaDescriptor(next, out kPtr, out kLen, out opt, out next, machine);       // key
+            uint ctxPtr, ctxLen; UnpackDmaDescriptor(next, out ctxPtr, out ctxLen, out opt, out next, machine); // ctx-state
+            uint dPtr, dLen; UnpackDmaDescriptor(next, out dPtr, out dLen, out opt, out next, machine);       // data chunk
+
+            if(!ccmContexts.ContainsKey(ctxPtr))
+            {
+                parent.Log(LogLevel.Error, "CCM_MULTIPART_UPDATE: unknown ctx 0x{0:X}", ctxPtr);
+                return ResponseCode.InvalidParameter;
+            }
+            var ctx = ccmContexts[ctxPtr];
+
+            byte[] inData = new byte[dLen]; FetchFromRam(dPtr, inData, 0, dLen);
+            byte[] outData = new byte[dLen];
+            CcmCtrProcess(ctx, inData, (int)dLen, outData, 0);
+            // The MAC authenticates the plaintext; CcmBlockCipher (used at finish) consumes ciphertext for
+            // decrypt and plaintext for encrypt -- in both cases that is exactly the *input* to this call.
+            ctx.Data.AddRange(inData);
+
+            uint outPtr, outLen; UnpackDmaDescriptor(outputDma, out outPtr, out outLen, out opt, out next, machine);
+            WriteToRam(outData, 0, outPtr, dLen);
+            // second output = updated ctx-state (opaque); leave as-is.
+            return ResponseCode.Ok;
+        }
+
+        // finish: params [0]=keyMeta [1]=totalMsgLen [2]=finalBlockLen.
+        // inputs: auth, key, ctx-state(32), final-block, [tag (decrypt only)].
+        // outputs: final-block-out, [tag (encrypt only)].
+        private ResponseCode CcmMultipartFinish(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount, bool isDecrypt)
+        {
+            uint finalLen = (commandParamsCount >= 3) ? commandParams[2] : 0;
+            DmaTransferOptions opt;
+            uint next = inputDma;
+            uint aPtr, aLen; UnpackDmaDescriptor(next, out aPtr, out aLen, out opt, out next, machine);       // auth
+            uint kPtr, kLen; UnpackDmaDescriptor(next, out kPtr, out kLen, out opt, out next, machine);       // key
+            uint ctxPtr, ctxLen; UnpackDmaDescriptor(next, out ctxPtr, out ctxLen, out opt, out next, machine); // ctx-state
+            uint fPtr, fLen; UnpackDmaDescriptor(next, out fPtr, out fLen, out opt, out next, machine);       // final block
+
+            if(!ccmContexts.ContainsKey(ctxPtr))
+            {
+                parent.Log(LogLevel.Error, "CCM_MULTIPART_FINISH: unknown ctx 0x{0:X}", ctxPtr);
+                return ResponseCode.InvalidParameter;
+            }
+            var ctx = ccmContexts[ctxPtr];
+
+            byte[] finalIn = new byte[fLen]; FetchFromRam(fPtr, finalIn, 0, fLen);
+            byte[] finalOut = new byte[fLen];
+            if(fLen > 0)
+            {
+                CcmCtrProcess(ctx, finalIn, (int)fLen, finalOut, 0);
+            }
+            ctx.Data.AddRange(finalIn);
+
+            ResponseCode result = ResponseCode.Ok;
+            if(isDecrypt)
+            {
+                // The tag is the last input descriptor.
+                uint tagPtr, tagLen; UnpackDmaDescriptor(next, out tagPtr, out tagLen, out opt, out next, machine);
+                byte[] tag = new byte[tagLen]; FetchFromRam(tagPtr, tag, 0, tagLen);
+
+                byte[] ct = ctx.Data.ToArray();
+                byte[] ctPlusTag = new byte[ct.Length + tag.Length];
+                Array.Copy(ct, 0, ctPlusTag, 0, ct.Length);
+                Array.Copy(tag, 0, ctPlusTag, ct.Length, tag.Length);
+
+                var ccm = new CcmBlockCipher(new AesEngine());
+                ccm.Init(false, new AeadParameters(new KeyParameter(ctx.Key), (int)tagLen * 8, ctx.Nonce, ctx.Aad));
+                byte[] pt = new byte[ct.Length];
+                try
+                {
+                    ccm.ProcessPacket(ctPlusTag, 0, ctPlusTag.Length, pt, 0);
+                }
+                catch(Exception e)
+                {
+                    if(e is InvalidCipherTextException) { result = ResponseCode.CryptoError; }
+                    else { throw; }
+                }
+                if(fLen > 0)
+                {
+                    uint oPtr, oLen; UnpackDmaDescriptor(outputDma, out oPtr, out oLen, out opt, out next, machine);
+                    WriteToRam(finalOut, 0, oPtr, fLen);
+                }
+                parent.Log(LogLevel.Noisy, "CCM_MULTIPART_FINISH(dec): ctx=0x{0:X} totalLen={1} tagMatch={2}",
+                         ctxPtr, ct.Length, result == ResponseCode.Ok);
+            }
+            else
+            {
+                byte[] ptAll = ctx.Data.ToArray();
+                var ccm = new CcmBlockCipher(new AesEngine());
+                ccm.Init(true, new AeadParameters(new KeyParameter(ctx.Key), (int)ctx.TagLen * 8, ctx.Nonce, ctx.Aad));
+                byte[] ctPlusTag = new byte[ptAll.Length + ctx.TagLen];
+                ccm.ProcessPacket(ptAll, 0, ptAll.Length, ctPlusTag, 0);
+                byte[] tag = new byte[ctx.TagLen];
+                Array.Copy(ctPlusTag, ptAll.Length, tag, 0, (int)ctx.TagLen);
+
+                uint outNext = outputDma;
+                uint oPtr, oLen; UnpackDmaDescriptor(outNext, out oPtr, out oLen, out opt, out outNext, machine);  // final block out
+                if(fLen > 0) { WriteToRam(finalOut, 0, oPtr, fLen); }
+                uint tPtr, tLen; UnpackDmaDescriptor(outNext, out tPtr, out tLen, out opt, out outNext, machine);  // tag out
+                WriteToRam(tag, 0, tPtr, tLen);
+                parent.Log(LogLevel.Noisy, "CCM_MULTIPART_FINISH(enc): ctx=0x{0:X} totalLen={1}", ctxPtr, ptAll.Length);
+            }
+
+            ccmContexts.Remove(ctxPtr);
+            return result;
+        }
+
         private ResponseCode HandleAesCcmEncryptCommand(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount)
         {
             if(commandParamsCount != 4)
@@ -971,28 +1341,38 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             FetchFromRam(aadPtr, aad, 0, aadLength);
             parent.Log(LogLevel.Noisy, "Aad=[{0}]", BitConverter.ToString(aad));
 
-            // Fifth input DMA descriptor contains the plaintext input data
-            uint inputDataPtr;
-            uint inputDataLength;
-            UnpackDmaDescriptor(nextDescriptorPtr, out inputDataPtr, out inputDataLength, out transferOptions, out nextDescriptorPtr, machine);
-            parent.Log(LogLevel.Noisy, "AES_CCM_ENCRYPT: INPUT4: inputDataPtr=0x{0:X} inputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
-                     inputDataPtr, inputDataLength, transferOptions, nextDescriptorPtr);
-            byte[] inputData = new byte[inputDataLength];
-            FetchFromRam(inputDataPtr, inputData, 0, inputDataLength);
-            parent.Log(LogLevel.Noisy, "InputData=[{0}]", BitConverter.ToString(inputData));
+            // Fifth input DMA descriptor contains the plaintext. When empty (e.g. an encrypted empty-payload
+            // MRP acknowledgement) the SE omits this descriptor, so only read it when there is data.
+            uint inputDataPtr = 0;
+            uint inputDataLength = 0;
+            byte[] inputData = new byte[inputDataSize];
+            if(inputDataSize > 0)
+            {
+                UnpackDmaDescriptor(nextDescriptorPtr, out inputDataPtr, out inputDataLength, out transferOptions, out nextDescriptorPtr, machine);
+                parent.Log(LogLevel.Noisy, "AES_CCM_ENCRYPT: INPUT4: inputDataPtr=0x{0:X} inputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+                         inputDataPtr, inputDataLength, transferOptions, nextDescriptorPtr);
+                FetchFromRam(inputDataPtr, inputData, 0, inputDataLength);
+                parent.Log(LogLevel.Noisy, "InputData=[{0}]", BitConverter.ToString(inputData));
+            }
 
-            // First output DMA descriptor contains the encrypted output data
-            uint outputDataPtr;
-            uint outputDataLength;
-            UnpackDmaDescriptor(outputDma, out outputDataPtr, out outputDataLength, out transferOptions, out nextDescriptorPtr, machine);
-            parent.Log(LogLevel.Noisy, "AES_CCM_ENCRYPT: OUTPUT0: outputDataPtr=0x{0:X} outputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
-                     outputDataPtr, outputDataLength, transferOptions, nextDescriptorPtr);
-
-            // Second output DMA descriptor contains the output tag
+            // First output DMA descriptor contains the encrypted output data -- omitted when the ciphertext
+            // is empty, in which case the output DMA points directly at the tag descriptor.
+            uint outputDataPtr = 0;
+            uint outputDataLength = 0;
             uint outputTagPtr;
             uint outputTagLength;
-            UnpackDmaDescriptor(nextDescriptorPtr, out outputTagPtr, out outputTagLength, out transferOptions, out nextDescriptorPtr, machine);
-            parent.Log(LogLevel.Noisy, "AES_CCM_ENCRYPT: OUTPUT1: outputTagPtr=0x{0:X} outputTagLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+            if(inputDataSize > 0)
+            {
+                UnpackDmaDescriptor(outputDma, out outputDataPtr, out outputDataLength, out transferOptions, out nextDescriptorPtr, machine);
+                parent.Log(LogLevel.Noisy, "AES_CCM_ENCRYPT: OUTPUT0: outputDataPtr=0x{0:X} outputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+                         outputDataPtr, outputDataLength, transferOptions, nextDescriptorPtr);
+                UnpackDmaDescriptor(nextDescriptorPtr, out outputTagPtr, out outputTagLength, out transferOptions, out nextDescriptorPtr, machine);
+            }
+            else
+            {
+                UnpackDmaDescriptor(outputDma, out outputTagPtr, out outputTagLength, out transferOptions, out nextDescriptorPtr, machine);
+            }
+            parent.Log(LogLevel.Noisy, "AES_CCM_ENCRYPT: OUTPUT1(tag): outputTagPtr=0x{0:X} outputTagLength={1} options={2} nextDescriptorPtr=0x{3:X}",
                      outputTagPtr, outputTagLength, transferOptions, nextDescriptorPtr);
 
             CcmBlockCipher cipher = new CcmBlockCipher(new AesEngine());
@@ -1631,8 +2011,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             uint nonceSize = (commandParams[1] >> 16) & 0xFFFF;
             uint associatedAuthenticatedDataSize = commandParams[2];
             uint inputDataSize = commandParams[3];
-            parent.Log(LogLevel.Noisy, "AES_CCM_DECRYPT: Other Command Params: tagSize={0} nonceSize={1} aadSize={2} inputDataSize={3}",
-                     tagSize, nonceSize, associatedAuthenticatedDataSize, inputDataSize);
+            parent.Log(LogLevel.Noisy, "AES_CCM_DECRYPT params: tagSize={0} nonceSize={1} aadSize={2} inputDataSize={3}", tagSize, nonceSize, associatedAuthenticatedDataSize, inputDataSize);
 
             if(!IsTagSizeValid(tagSize) || !IsNonceSizeValid(nonceSize))
             {
@@ -1678,14 +2057,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             FetchFromRam(aadPtr, aad, 0, aadLength);
             parent.Log(LogLevel.Noisy, "Aad=[{0}]", BitConverter.ToString(aad));
 
-            // Fifth input DMA descriptor contains the plaintext input data
-            uint inputDataPtr;
-            uint inputDataLength;
-            UnpackDmaDescriptor(nextDescriptorPtr, out inputDataPtr, out inputDataLength, out transferOptions, out nextDescriptorPtr, machine);
-            parent.Log(LogLevel.Noisy, "AES_CCM_DECRYPT: INPUT4: inputDataPtr=0x{0:X} inputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
-                     inputDataPtr, inputDataLength, transferOptions, nextDescriptorPtr);
+            // Fifth input DMA descriptor contains the ciphertext. When the ciphertext is empty (e.g. an
+            // encrypted empty-payload MRP acknowledgement, which still carries AAD + tag) the SE omits this
+            // descriptor, so only read it when there is data -- otherwise the descriptor walk runs off the
+            // end of the chain into the null terminator and throws.
+            uint inputDataPtr = 0;
+            uint inputDataLength = 0;
+            if(inputDataSize > 0)
+            {
+                UnpackDmaDescriptor(nextDescriptorPtr, out inputDataPtr, out inputDataLength, out transferOptions, out nextDescriptorPtr, machine);
+                parent.Log(LogLevel.Noisy, "AES_CCM_DECRYPT: INPUT4: inputDataPtr=0x{0:X} inputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+                         inputDataPtr, inputDataLength, transferOptions, nextDescriptorPtr);
+            }
 
-            // Sixth input DMA descriptor contains the tag to be verified
+            // Next input DMA descriptor contains the tag to be verified
             uint tagPtr;
             uint tagLength;
             UnpackDmaDescriptor(nextDescriptorPtr, out tagPtr, out tagLength, out transferOptions, out nextDescriptorPtr, machine);
@@ -1697,14 +2082,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             FetchFromRam(tagPtr, inputDataAndTag, inputDataLength, tagLength);
             parent.Log(LogLevel.Noisy, "InputDataAndTag=[{0}]", BitConverter.ToString(inputDataAndTag));
 
-            // First output DMA descriptor contains the decrypted output data
-            uint outputDataPtr;
-            uint outputDataLength;
-            UnpackDmaDescriptor(outputDma, out outputDataPtr, out outputDataLength, out transferOptions, out nextDescriptorPtr, machine);
-            parent.Log(LogLevel.Noisy, "AES_CCM_DECRYPT: OUTPUT0: outputDataPtr=0x{0:X} outputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
-                     outputDataPtr, outputDataLength, transferOptions, nextDescriptorPtr);
+            // First output DMA descriptor contains the decrypted output data -- likewise omitted when the
+            // plaintext output is empty.
+            uint outputDataPtr = 0;
+            uint outputDataLength = 0;
+            if(inputDataSize > 0)
+            {
+                UnpackDmaDescriptor(outputDma, out outputDataPtr, out outputDataLength, out transferOptions, out nextDescriptorPtr, machine);
+                parent.Log(LogLevel.Noisy, "AES_CCM_DECRYPT: OUTPUT0: outputDataPtr=0x{0:X} outputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+                         outputDataPtr, outputDataLength, transferOptions, nextDescriptorPtr);
+            }
             byte[] outputData = new byte[outputDataLength];
-
             CcmBlockCipher cipher = new CcmBlockCipher(new AesEngine());
             AeadParameters parameters = new AeadParameters(keyParameter, (int)tagLength*8, nonce, aad);
             cipher.Init(false, parameters);
@@ -2091,6 +2479,263 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             parent.Log(LogLevel.Noisy, "READ_PUB_KEY: PublicKey=[{0}]", BitConverter.ToString(outputPublicKey));
 
             return ResponseCode.Ok;
+        }
+
+        private ResponseCode HandleSignatureSignCommand(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount, uint commandOptions)
+        {
+            // ECDSA signature sign (SE command 0x0600). Used by Matter for DAC attestation signing
+            // and CSR / operational (NOC) key signing. The host (PSA driver) pre-hashes the message and
+            // passes a digest, so the SE receives a precomputed digest -- the low command-word bits (SHA
+            // mode) are 0 in that case. commandParams[0] is the EccWeirstrass key metadata; commandParams[1]
+            // is the message/digest length in bytes. Input descriptors: auth, private key, message/digest.
+            // Output descriptor: raw r||s signature (2 * keysize bytes). random-k (not RFC6979); still a
+            // valid ECDSA signature over the supplied digest, which is what the CSR/NOC verifier requires.
+            if(commandParamsCount != 2)
+            {
+                parent.Log(LogLevel.Error, "SIGNATURE_SIGN: invalid parameter count {0} (expected 2)", commandParamsCount);
+                return ResponseCode.Abort;
+            }
+
+            uint keyMetadata = commandParams[0];
+            uint messageLength = commandParams[1];
+
+            KeyMode keyMode;
+            KeyType keyType;
+            KeyRestriction keyRestriction;
+            uint keyIndex;
+            UnpackKeyMetadata(keyMetadata, out keyIndex, out keyType, out keyMode, out keyRestriction);
+            parent.Log(LogLevel.Noisy, "SIGNATURE_SIGN: keyIndex={0} keyType={1} keyMode={2} keyRestriction={3} messageLength={4}",
+                     keyIndex, keyType, keyMode, keyRestriction, messageLength);
+
+            // TODO: for now we only support EccWeirstrass key type
+            if(keyType != KeyType.EccWeirstrass)
+            {
+                parent.Log(LogLevel.Error, "SIGNATURE_SIGN: KeyType={0} not supported", keyType);
+                return ResponseCode.InvalidParameter;
+            }
+
+            EccWeirstrassKeyMetadata wprKeyMetadata = UnpackWeirstrassPrimeFieldKeyMetadata(keyMetadata);
+            uint privateInputKeyLength = wprKeyMetadata.Size;
+            if(!wprKeyMetadata.HasPrivateKey)
+            {
+                parent.Log(LogLevel.Error, "SIGNATURE_SIGN: Input EccWeirstrass has no private key");
+                return ResponseCode.InvalidParameter;
+            }
+
+            uint nextDescriptorPtr = inputDma;
+            DmaTransferOptions transferOptions;
+
+            // First input DMA descriptor: authorization data (empty for plaintext/wrapped keys).
+            uint authDataPtr;
+            uint authDataLength;
+            UnpackDmaDescriptor(nextDescriptorPtr, out authDataPtr, out authDataLength, out transferOptions, out nextDescriptorPtr, machine);
+            parent.Log(LogLevel.Noisy, "SIGNATURE_SIGN: INPUT0(auth): authDataPtr=0x{0:X} authDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+                       authDataPtr, authDataLength, transferOptions, nextDescriptorPtr);
+
+            // Second input DMA descriptor: the private key.
+            uint privateInputKeyPtr;
+            uint privateInputKeyDescLength;
+            UnpackDmaDescriptor(nextDescriptorPtr, out privateInputKeyPtr, out privateInputKeyDescLength, out transferOptions, out nextDescriptorPtr, machine);
+            parent.Log(LogLevel.Noisy, "SIGNATURE_SIGN: INPUT1(key): privateInputKeyPtr=0x{0:X} privateInputKeyDescLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+                       privateInputKeyPtr, privateInputKeyDescLength, transferOptions, nextDescriptorPtr);
+
+            byte[] privateInputKey = null;
+            switch(keyMode)
+            {
+            case KeyMode.Unprotected:
+            {
+                if(privateInputKeyDescLength != privateInputKeyLength)
+                {
+                    parent.Log(LogLevel.Error, "SIGNATURE_SIGN: input key descriptor length mismatch {0} - {1}", privateInputKeyDescLength, privateInputKeyLength);
+                    return ResponseCode.InvalidParameter;
+                }
+                privateInputKey = new byte[privateInputKeyLength];
+                FetchFromRam(privateInputKeyPtr, privateInputKey, 0, privateInputKeyLength);
+                break;
+            }
+            case KeyMode.Wrapped:
+            {
+                ResponseCode result = ReadWrappedKeyFromDescriptor(privateInputKeyPtr, privateInputKeyDescLength, out privateInputKey);
+                if(result != ResponseCode.Ok)
+                {
+                    return result;
+                }
+                break;
+            }
+            case KeyMode.Volatile:
+            {
+                if(!volatileKeys.ContainsKey(keyIndex))
+                {
+                    parent.Log(LogLevel.Error, "SIGNATURE_SIGN: Volatile key not found, slot={0}", keyIndex);
+                    return ResponseCode.InvalidParameter;
+                }
+                privateInputKey = volatileKeys[keyIndex];
+                break;
+            }
+            case KeyMode.Ksu:
+            {
+                privateInputKey = ksuStorage.GetKey(keyIndex);
+                break;
+            }
+            default:
+                parent.Log(LogLevel.Error, "SIGNATURE_SIGN: keyMode={0} invalid", keyMode);
+                return ResponseCode.InvalidParameter;
+            }
+            parent.Log(LogLevel.Noisy, "SIGNATURE_SIGN: PrivateKey=[{0}]", BitConverter.ToString(privateInputKey));
+
+            // Third input DMA descriptor: the message/digest to sign. Matter/PSA pre-hashes, so this is a
+            // precomputed digest of length messageLength (== keysize for P-256).
+            uint messagePtr;
+            uint messageDescLength;
+            UnpackDmaDescriptor(nextDescriptorPtr, out messagePtr, out messageDescLength, out transferOptions, out nextDescriptorPtr, machine);
+            parent.Log(LogLevel.Noisy, "SIGNATURE_SIGN: INPUT2(message): messagePtr=0x{0:X} messageDescLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+                       messagePtr, messageDescLength, transferOptions, nextDescriptorPtr);
+            byte[] message = new byte[messageDescLength];
+            FetchFromRam(messagePtr, message, 0, messageDescLength);
+            parent.Log(LogLevel.Noisy, "SIGNATURE_SIGN: Message/Digest=[{0}]", BitConverter.ToString(message));
+
+            // sl_se_ecc_sign has two modes: hashed_message=1 (command options 0) means `message` is a
+            // precomputed digest, signed as-is; hashed_message=0 (command options carry the hash algorithm,
+            // non-zero) means `message` is the raw message and the SE must hash it first. Matter P-256 uses
+            // SHA-256. Treating a raw message as a digest (and truncating to 32 bytes) silently signs the
+            // wrong thing -- that is what made ValidateCSR (and DAC attestation) fail.
+            byte[] digest;
+            if((commandOptions & 0xFFFF) != 0)
+            {
+                var signHash = new Sha256Digest();
+                signHash.BlockUpdate(message, 0, message.Length);
+                digest = new byte[signHash.GetDigestSize()];
+                signHash.DoFinal(digest, 0);
+            }
+            else
+            {
+                digest = message;
+                if(message.Length > privateInputKeyLength)
+                {
+                    digest = new byte[privateInputKeyLength];
+                    Array.Copy(message, 0, digest, 0, (int)privateInputKeyLength);
+                }
+            }
+
+            // Build the EC private key and sign (random-k ECDSA over the raw digest, no re-hashing).
+            // A stored EccWeirstrass key blob is [private(Size) | publicX(Size) | publicY(Size)]; use only
+            // the leading `privateInputKeyLength` bytes as the private scalar (otherwise the whole blob is
+            // read as the scalar and the signature won't verify against the key's real public point --
+            // this is what made ValidateCSR fail).
+            byte[] privateScalar = privateInputKey;
+            if(privateInputKey.Length > privateInputKeyLength)
+            {
+                privateScalar = new byte[privateInputKeyLength];
+                Array.Copy(privateInputKey, 0, privateScalar, 0, (int)privateInputKeyLength);
+            }
+            ECDomainParameters domainParams = GetECDomainParametersFromKeyLength(privateInputKeyLength * 8);
+            BigInteger privateKeyValue = new BigInteger(1, privateScalar);
+            ECPrivateKeyParameters privateKeyParam = new ECPrivateKeyParameters(privateKeyValue, domainParams);
+
+            ECDsaSigner signer = new ECDsaSigner();
+            signer.Init(true, privateKeyParam);
+            BigInteger[] rs = signer.GenerateSignature(digest);
+            BigInteger r = rs[0];
+            BigInteger s = rs[1];
+
+            // Output DMA descriptor: raw r||s, each padded to keysize (64 bytes total for P-256).
+            byte[] rBytes = BigIntegerToFixedByteArray(r, (int)privateInputKeyLength);
+            byte[] sBytes = BigIntegerToFixedByteArray(s, (int)privateInputKeyLength);
+            byte[] signature = new byte[privateInputKeyLength * 2];
+            Array.Copy(rBytes, 0, signature, 0, (int)privateInputKeyLength);
+            Array.Copy(sBytes, 0, signature, (int)privateInputKeyLength, (int)privateInputKeyLength);
+
+            uint outputDataPtr;
+            uint outputDataLength;
+            UnpackDmaDescriptor(outputDma, out outputDataPtr, out outputDataLength, out transferOptions, out nextDescriptorPtr, machine);
+            parent.Log(LogLevel.Noisy, "SIGNATURE_SIGN: OUTPUT0: outputDataPtr=0x{0:X} outputDataLength={1} options={2} nextDescriptorPtr=0x{3:X}",
+                       outputDataPtr, outputDataLength, transferOptions, nextDescriptorPtr);
+            if(outputDataLength != signature.Length)
+            {
+                parent.Log(LogLevel.Error, "SIGNATURE_SIGN: output descriptor length mismatch {0} vs expected {1}", outputDataLength, signature.Length);
+                return ResponseCode.InvalidParameter;
+            }
+
+            WriteToRam(signature, 0, outputDataPtr, outputDataLength);
+            parent.Log(LogLevel.Noisy, "SIGNATURE_SIGN: Signature(r||s)=[{0}]", BitConverter.ToString(signature));
+            return ResponseCode.Ok;
+        }
+
+        private ResponseCode HandleSignatureVerifyCommand(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount, uint commandOptions)
+        {
+            // ECDSA-P256 verify (SE command 0x0601). Matter validates a root/NOC certificate's self-
+            // signature via this during AddTrustedRootCertificate / AddNOC; an unimplemented verify made
+            // the device reject AddTrustedRootCertificate with INVALID_COMMAND. params: [0]=public-key
+            // metadata, [1]=message length, [2]=signature length. inputs: auth, public key, message/digest,
+            // signature (raw r||s). No output -- the response code is Ok or InvalidSignature.
+            if(commandParamsCount < 2)
+            {
+                parent.Log(LogLevel.Error, "SIGNATURE_VERIFY: invalid parameter count {0}", commandParamsCount);
+                return ResponseCode.Abort;
+            }
+
+            KeyMode keyMode; KeyType keyType; KeyRestriction keyRestriction; uint keyIndex;
+            UnpackKeyMetadata(commandParams[0], out keyIndex, out keyType, out keyMode, out keyRestriction);
+            if(keyType != KeyType.EccWeirstrass)
+            {
+                parent.Log(LogLevel.Error, "SIGNATURE_VERIFY: KeyType={0} not supported", keyType);
+                return ResponseCode.InvalidParameter;
+            }
+            EccWeirstrassKeyMetadata wpr = UnpackWeirstrassPrimeFieldKeyMetadata(commandParams[0]);
+            uint keySize = wpr.Size;
+
+            DmaTransferOptions opt;
+            uint next = inputDma;
+            uint authPtr, authLen; UnpackDmaDescriptor(next, out authPtr, out authLen, out opt, out next, machine); // auth
+            uint pubPtr, pubLen;   UnpackDmaDescriptor(next, out pubPtr, out pubLen, out opt, out next, machine);   // public key
+            byte[] pub = new byte[pubLen]; FetchFromRam(pubPtr, pub, 0, pubLen);
+            uint msgPtr, msgLen;   UnpackDmaDescriptor(next, out msgPtr, out msgLen, out opt, out next, machine);   // message/digest
+            byte[] msg = new byte[msgLen]; FetchFromRam(msgPtr, msg, 0, msgLen);
+            uint sigPtr, sigLen;   UnpackDmaDescriptor(next, out sigPtr, out sigLen, out opt, out next, machine);   // signature r||s
+            byte[] sig = new byte[sigLen]; FetchFromRam(sigPtr, sig, 0, sigLen);
+
+            // Match the sign convention: hash the raw message (SHA-256) when the command options are set;
+            // options==0 means a precomputed digest.
+            byte[] digest;
+            if((commandOptions & 0xFFFF) != 0)
+            {
+                var verHash = new Sha256Digest();
+                verHash.BlockUpdate(msg, 0, msg.Length);
+                digest = new byte[verHash.GetDigestSize()];
+                verHash.DoFinal(digest, 0);
+            }
+            else
+            {
+                digest = msg;
+                if(msg.Length > keySize)
+                {
+                    digest = new byte[keySize];
+                    Array.Copy(msg, 0, digest, 0, (int)keySize);
+                }
+            }
+
+            if(sig.Length < keySize * 2 || pub.Length < keySize * 2)
+            {
+                parent.Log(LogLevel.Error, "SIGNATURE_VERIFY: short pub/sig (pub={0} sig={1} keySize={2})", pub.Length, sig.Length, keySize);
+                return ResponseCode.InvalidParameter;
+            }
+
+            // Public key: X||Y (each keySize), optionally with a leading 0x04 uncompressed-point prefix.
+            int pubOff = (pub.Length == keySize * 2 + 1 && pub[0] == 0x04) ? 1 : 0;
+            byte[] pxB = new byte[keySize]; Array.Copy(pub, pubOff, pxB, 0, (int)keySize);
+            byte[] pyB = new byte[keySize]; Array.Copy(pub, pubOff + (int)keySize, pyB, 0, (int)keySize);
+            byte[] rB = new byte[keySize]; Array.Copy(sig, 0, rB, 0, (int)keySize);
+            byte[] sB = new byte[keySize]; Array.Copy(sig, (int)keySize, sB, 0, (int)keySize);
+
+            ECDomainParameters domainParams = GetECDomainParametersFromKeyLength(keySize * 8);
+            ECPoint q = domainParams.Curve.CreatePoint(new BigInteger(1, pxB), new BigInteger(1, pyB));
+            ECPublicKeyParameters pubParam = new ECPublicKeyParameters(q, domainParams);
+
+            ECDsaSigner verifier = new ECDsaSigner();
+            verifier.Init(false, pubParam);
+            bool valid = verifier.VerifySignature(digest, new BigInteger(1, rB), new BigInteger(1, sB));
+            parent.Log(LogLevel.Noisy, "SIGNATURE_VERIFY: keySize={0} msgLen={1} valid={2}", keySize, msgLen, valid);
+            return valid ? ResponseCode.Ok : ResponseCode.InvalidSignature;
         }
 
         private ResponseCode HandleDiffieHellmanCommand(uint inputDma, uint outputDma, uint[] commandParams, uint commandParamsCount)
@@ -3753,6 +4398,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
         private readonly bool series3;
         private readonly List<AsymmetricCipherKeyPair> ecKeyPairs = new List<AsymmetricCipherKeyPair>();
         private readonly Dictionary<uint, byte[]> volatileKeys = new Dictionary<uint, byte[]>();
+        // Running state for the CCM multipart flow (sl_se_ccm_multipart_starts/update/finish, SE cmd
+        // 0x0405/0x0406 with options 0x0001/0x0003/0x0002). Keyed by the 32-byte ctx-state buffer pointer
+        // that the device passes between the three commands. Required for CHIP operational-message crypto.
+        private readonly Dictionary<uint, CcmMultipartContext> ccmContexts = new Dictionary<uint, CcmMultipartContext>();
         private readonly uint flashDataRegionStart;
         private readonly uint flashCodeRegionEnd;
         private readonly uint flashCodeRegionStart;
@@ -4017,6 +4666,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 return true;
             }
 
+            // Restore the running message byte count. The SE carries only H1..H8 (32 bytes) in the
+            // state descriptor; the total length hashed so far is provided separately (the FINISH
+            // command's counter parameter) and is needed for correct final length padding.
+            public void SetByteCount(long count)
+            {
+                byteCount = count;
+            }
+
             private void ProcessWord(byte[] input, int inOff)
             {
                 X[xOff] = BE_To_UInt32(input, inOff);
@@ -4239,6 +4896,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             CreateKey                       = 0x0200,
             ReadPublicKey                   = 0x0201,
             DeriveKey                       = 0x0202,
+            SignatureSign                   = 0x0600,
+            SignatureVerify                 = 0x0601,
             Hash                            = 0x0300,
             HashUpdate                      = 0x0301,
             HashHmac                        = 0x0302,

@@ -49,7 +49,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 {(long)Registers.TxStatus, new DoubleWordRegister(this)
                     .WithValueField(0, 16, FieldMode.Read, valueProviderCallback: _ => (uint)TxFifoWordsCount, name: "REMBYTES")
                     .WithValueField(16, 4, FieldMode.Read, valueProviderCallback: _ => 0 /* TODO */, name: "MSGINFO")
-                    .WithFlag(20, FieldMode.Read, valueProviderCallback: _ => !TxFifoIsAlmostFull, name: "TXINT")
+                    .WithFlag(20, FieldMode.Read, valueProviderCallback: _ => !TxFifoIsFull, name: "TXINT")
                     .WithFlag(21, FieldMode.Read, valueProviderCallback: _ => TxFifoIsFull, name: "TXFULL")
                     .WithReservedBits(22, 1)
                     .WithFlag(23, FieldMode.Read, valueProviderCallback: _ => false /* TODO */, name: "TXERROR")
@@ -113,7 +113,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             {
                 // TXINT: Interrupt status (same value as interrupt signal). 
                 // High when TX FIFO is not almost-full (enough available space to start sending a message).
-                var irq = txInterruptEnable.Value && !TxFifoIsAlmostFull;
+                var irq = txInterruptEnable.Value && !TxFifoIsFull;
                 if(irq)
                 {
                     this.Log(LogLevel.Noisy, "IRQ TX set");
@@ -205,8 +205,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
 
         private int RxFifoWordsCount => rxFifo.Count;
 
-        private bool TxFifoIsAlmostFull => (TxFifoWordsCount >= TxFifoAlmostFullThreshold);
-
         private bool TxFifoIsFull => (TxFifoWordsCount == FifoWordSize);
 
         private bool RxFifoIsFull => (RxFifoWordsCount == FifoWordSize);
@@ -266,12 +264,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
         private readonly Queue<uint> txFifo;
         private readonly SiLabs_SecureElement secureElement;
         private const uint FifoWordSize = 16;
-        // TODO: according to the design book, TXSTATUS.TXINT field: "Interrupt status (same value as interrupt signal). 
-        // High when TX FIFO is not almost-full (enough available space to start sending a message)."
-        // As of now I don't know what "enough available space to send a message" means, so for now I assume a message
-        // needs the whole FIFO.
-        private const uint TxFifoAlmostFullThreshold = 1;
-
         private enum Registers
         {
             Fifo0           = 0x00,

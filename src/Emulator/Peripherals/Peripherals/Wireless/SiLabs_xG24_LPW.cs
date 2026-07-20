@@ -2674,7 +2674,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     .WithFlag(0, FieldMode.Set, writeCallback: (_, value) => { RAC_em1pAckPending = true; }, name: "RADIOEM1PMODE")
                     .WithFlag(1, name: "RADIOEM1PMODE")
                     .WithReservedBits(2, 2)
-                    .WithFlag(4, name: "MCUEM1PMODE")
+                    // RENODE fidelity fix: the MCU requests radio EM1-peripheral entry by
+                    // writing MCUEM1PMODE (bit 4). On real silicon the radio power domain
+                    // acknowledges via RADIOEM1PACK (bit 17). The model already wires the
+                    // bit-0 request path to RAC_em1pAckPending; the stock EFR32MG24 Matter
+                    // firmware uses the MCU-side request bit instead, so honour it the same
+                    // way. Without this the firmware busy-polls RADIOEM1PACK forever once it
+                    // goes operational (radio idle EM1 transition), cratering emulated time.
+                    .WithFlag(4, FieldMode.Set, writeCallback: (_, value) => { if(value) { RAC_em1pAckPending = true; } }, name: "MCUEM1PMODE")
                     .WithFlag(5, name: "MCUEM1PDISSWREQ")
                     .WithReservedBits(6, 10)
                     .WithFlag(16, name: "RADIOEM1PREQ")

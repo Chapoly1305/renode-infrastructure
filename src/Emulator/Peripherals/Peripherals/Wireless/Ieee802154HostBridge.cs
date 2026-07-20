@@ -127,6 +127,18 @@ namespace Antmicro.Renode.Peripherals.Wireless
             // 32us/byte; the received frame omits the 4-byte preamble, so add it back).
             var airTimeUs = (ulong)(frame.Length + PreambleBytes) * MicrosecondsPerByte;
 
+            // Half-duplex: while the device is transmitting a LARGE frame it cannot receive; the inject pump
+            // should defer so a host->device fragment isn't lost colliding with it. This is the dominant loss
+            // source for the large fragmented CASE messages. IMPORTANT: only gate on LARGE device frames
+            // (>kHalfDuplexGateBytes) -- deferring during every small MLE frame (advertisements etc.) delays
+            // otbr's join requests past its (patched-short) MLE timeouts and breaks the otbr<->device attach.
+            if(mpdu.Length > kHalfDuplexGateBytes)
+            {
+                deviceTxInProgress = true;
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(airTimeUs + AckTurnaroundMicroseconds),
+                                       _ => deviceTxInProgress = false, "ieee802154-devtx-busy");
+            }
+
             if(IsUnicastAckRequest(mpdu))
             {
                 // A unicast frame the device expects to be ACKed. Two things must be true or the MLE attach
@@ -237,6 +249,57 @@ namespace Antmicro.Renode.Peripherals.Wireless
             }
         }
 
+        // ---- Serialized host->device delivery (collision avoidance) -------------------------------------
+        // Enqueue a host frame for delivery to the device and make sure the drain pump is running. Called
+        // from the host RX thread; the pump itself runs on the emulation thread.
+        private void EnqueueToDevice(byte[] mpdu)
+        {
+            bool startPump = false;
+            lock(injectLock)
+            {
+                deviceInjectQueue.Enqueue(mpdu);
+                if(!injectPumpRunning)
+                {
+                    injectPumpRunning = true;
+                    startPump = true;
+                }
+            }
+            if(startPump)
+            {
+                var vts = TimeDomainsManager.Instance.GetEffectiveVirtualTimeStamp();
+                machine.HandleTimeDomainEvent<object>(_ => PumpDeviceInject(), null, vts);
+            }
+        }
+
+        // Inject one queued frame, then re-arm after its air time (+ a guard gap) so the device has fully
+        // received it before the next frame starts -- no two host frames are ever on air at the device at once.
+        private void PumpDeviceInject()
+        {
+            lock(injectLock)
+            {
+                if(deviceInjectQueue.Count == 0)
+                {
+                    injectPumpRunning = false;
+                    return;
+                }
+            }
+            // Half-duplex guard: if the device is transmitting, it can't receive -- defer the injection
+            // (don't dequeue) and re-check shortly, so we never inject into a device TX and lose the frame.
+            if(deviceTxInProgress)
+            {
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(DeviceTxDeferMicroseconds), _ => PumpDeviceInject(), "ieee802154-inject-defer");
+                return;
+            }
+            byte[] mpdu;
+            lock(injectLock)
+            {
+                mpdu = deviceInjectQueue.Dequeue();
+            }
+            InjectToDevice(mpdu);
+            var airUs = (ulong)(mpdu.Length + PreambleBytes) * MicrosecondsPerByte + InterFrameGapMicroseconds;
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(airUs), _ => PumpDeviceInject(), "ieee802154-device-inject-pump");
+        }
+
         // ---- Host UDP transport: OpenThread "simulation" real-time virtual radio (multicast) ----------------
         // Every node joins multicast group 224.0.0.116 and receives on portBase; a node transmits from source
         // port portBase+nodeId (peers derive the sender node id from the source port) to group:portBase, with
@@ -343,10 +406,15 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     SendToHost(BuildAck(mpdu[2]));
                 }
 
-                // Marshal onto the emulation thread at the current virtual time (thread-safe; same mechanism
-                // the wireless medium uses to deliver inbound frames).
-                var vts = TimeDomainsManager.Instance.GetEffectiveVirtualTimeStamp();
-                machine.HandleTimeDomainEvent<byte[]>(InjectToDevice, mpdu, vts);
+                // Serialize delivery to the device instead of injecting immediately: the emulated radio
+                // drops any frame that arrives while it is already receiving another (ReceiveFrame ->
+                // "RX already ongoing" collision). The host side has TWO responders (leader + border router)
+                // plus periodic MLE advertisements, so their frames routinely overlap the device's multi-ms
+                // reception of a large Parent/Child-ID/Data Response -> the MLE attach handshake frame is
+                // silently lost and the device never completes attach (it self-partitions). Queue host->device
+                // frames and inject them one at a time, spaced by each frame's air time, so the device hears
+                // them cleanly, one after another. Device firmware stays stock; this is purely bridge behavior.
+                EnqueueToDevice(mpdu);
             }
         }
 
@@ -443,6 +511,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private byte[] learnedSync;
         private readonly object txLock = new object();
         private int inFlightInjections; // reference count for the single per-sender InterferenceQueue entry
+        private readonly object injectLock = new object();
+        private readonly System.Collections.Generic.Queue<byte[]> deviceInjectQueue = new System.Collections.Generic.Queue<byte[]>();
+        private bool injectPumpRunning; // true while the host->device drain pump is scheduling itself
+        private volatile bool deviceTxInProgress; // true while the device is transmitting (half-duplex; can't RX)
 
         // 802.15.4: min MPDU = FC(2)+seq(1)+FCS(2) = 5; max PSDU = 127. Sync word is a few bytes.
         private const int MinMpdu = 5;
@@ -457,5 +529,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
         // frame the bridge receives). Used to estimate the device's frame air time for ACK timing.
         private const ulong MicrosecondsPerByte = 32;
         private const int PreambleBytes = 4;
+        // Guard gap between serialized host->device frames so the device's RX of one frame fully completes
+        // (rxTimer + processing) before the next starts. A few symbol times is plenty.
+        private const ulong InterFrameGapMicroseconds = 300;
+        // How often the inject pump re-checks when it finds the device mid-transmission (half-duplex defer).
+        private const ulong DeviceTxDeferMicroseconds = 200;
+        // Only large device TX frames (data/6LoWPAN fragments) gate host->device injection; small MLE control
+        // frames (~70B advertisements) do NOT, so the otbr<->device MLE attach isn't delayed past its timeouts.
+        private const int kHalfDuplexGateBytes = 90;
     }
 }

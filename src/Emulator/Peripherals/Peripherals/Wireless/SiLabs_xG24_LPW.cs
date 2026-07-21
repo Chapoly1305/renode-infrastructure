@@ -202,7 +202,73 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("rac")]
         public uint ReadDoubleWordFromRadioController(long offset)
         {
-            return Read<RadioControllerRegisters>(radioControllerRegistersCollection, "Radio Controller (RAC)", offset);
+            var value = Read<RadioControllerRegisters>(radioControllerRegistersCollection, "Radio Controller (RAC)", offset);
+            return BreakStorageMailboxDeadlock(offset, value);
+        }
+
+        // RENODE fidelity fix -- two-core RAC Storage0 mailbox livelock.
+        // Post-operational, during an EM1P power transition, the M33 (RAIL, accesses RAC via the "rac_ns"
+        // alias 0xB8020000) and the radio SEQUENCER core (accesses via the "rac" alias 0xA8020000) coordinate
+        // through RAC Storage0 (offset 0x44) as a two-flag handshake:
+        //   * M33  raises bit2  (its flag) and, while waiting for the sequencer to lower bit18, repeatedly
+        //     TOGGLEs bit2 to 0 for a short timed window (RAILINT_880ea347 busy-delays ~2 ticks) so the
+        //     concurrently-running sequencer can observe bit2==0.
+        //   * SEQ  raises bit18 (its flag) and spin-reads Storage0 here waiting for bit2==0; once it sees
+        //     that window it proceeds and CLEARs bit18 (via the Storage0 clear-alias 0xA8022044), which lets
+        //     the M33's own wait-for-bit18==0 return. On real silicon the two cores run in parallel so the
+        //     sequencer always catches the window.
+        // Renode pins `SetGlobalSerialExecution true` (required for real-time host-bridge sync), so the M33
+        // runs its ENTIRE quantum -- opening AND closing the bit2 window -- before the sequencer is ever
+        // scheduled; the sequencer therefore only ever reads bit2==1 and the two cores LIVELOCK (the radio
+        // state machine wedges, 15.4 goes dormant, otbr times out the device, operational CASE never
+        // completes). Per-write time-sync (attempt #1) only sync-thrashed the RTF, and true parallel cores
+        // deadlock the time framework at boot -- so we resolve it at the model layer instead, which is
+        // scheduler-independent: when the sequencer reads Storage0 and BOTH handshake flags are set (the
+        // livelock signature), hand it the bit2==0 it is waiting for -- i.e. surface the M33's backoff window
+        // that serial execution hid. This alters only the value RETURNED to the sequencer's read, never the
+        // stored register, so the M33's view (and its own bit2 bookkeeping) is untouched.
+        private const uint RAC_Storage0MailboxM33Flag = 1u << 2;    // bit2  = M33 flag (set via "rac_ns")
+        private const uint RAC_Storage0MailboxSeqFlag = 1u << 18;   // bit18 = sequencer flag (set via "rac")
+        private const int RAC_Storage0SpinThreshold = 128;          // identical both-flags reads => confirmed spin
+        private uint racStorage0LastRead;
+        private int racStorage0SpinCount;
+        private uint BreakStorageMailboxDeadlock(long offset, uint value)
+        {
+            if((offset & 0xFFF) != (long)RadioControllerRegisters.Storage0)
+            {
+                return value;
+            }
+            // Intervene ONLY on a genuine livelock spin: the sequencer re-reading the IDENTICAL Storage0
+            // value with BOTH handshake flags set, many times consecutively. Normal operation touches
+            // Storage0 only a handful of times, so it never reaches the threshold and is left untouched --
+            // this avoids corrupting the many other uses of the sequencer scratch register (an earlier
+            // fire-on-any-both-flags-read version perturbed normal radio operation / MLE merge). Once the
+            // spin is confirmed we hand the sequencer the bit2==0 window that serial execution hid, so it
+            // proceeds and clears bit18 (releasing the M33). Only the RETURNED value is altered, never the
+            // stored register.
+            if((value & RAC_Storage0MailboxM33Flag) != 0 && (value & RAC_Storage0MailboxSeqFlag) != 0)
+            {
+                if(value == racStorage0LastRead)
+                {
+                    racStorage0SpinCount++;
+                }
+                else
+                {
+                    racStorage0LastRead = value;
+                    racStorage0SpinCount = 1;
+                }
+                if(racStorage0SpinCount >= RAC_Storage0SpinThreshold)
+                {
+                    this.Log(LogLevel.Warning, "Storage0 mailbox livelock detected (sequencer spun {0}x on 0x{1:X}); surfacing bit2==0 window to break it", racStorage0SpinCount, value);
+                    racStorage0SpinCount = 0;
+                    return value & ~RAC_Storage0MailboxM33Flag;
+                }
+            }
+            else
+            {
+                racStorage0SpinCount = 0;
+            }
+            return value;
         }
 
         [ConnectionRegionAttribute("protimer_ns")]
@@ -1388,6 +1454,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
         public Action[] PROTIMER_CaptureComparePrsEvent = new Action[PROTIMER_NumberOfCaptureCompareChannelPrsEvents];
 
         public bool LogBasicRadioActivityAsError = false;
+
+        // True when the radio is actively listening for a NEW frame (RAC state RxSearch) and will therefore
+        // accept an injected frame. Ieee802154HostBridge gates its host->device injection pump on this: a frame
+        // injected while the radio is transmitting / warming / mid-RX is dropped ("not in RXSEARCH"), and because
+        // the bridge synthesizes the host-side MAC-ACK immediately, otbr never retransmits it -- so e.g. the 2nd
+        // 6LoWPAN fragment of a Child ID Response is permanently lost and Thread attach never completes. Gating
+        // on RxSearch guarantees each injected fragment is truly received. Device firmware stays stock.
+        public bool IsRadioInRxSearch => RAC_currentRadioState == RAC_RadioState.RxSearch;
 
         private TimeInterval GetTime() => machine.LocalTimeSource.ElapsedVirtualTime;
 

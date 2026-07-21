@@ -597,6 +597,29 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 EnqueueAtt(new byte[] { 0x12, (byte)(c2CccdHandle & 0xFF), (byte)(c2CccdHandle >> 8), 0x00, 0x00 });
                 break;
             case HostFrameDisconnect:
+                // RENODE: the host (chip-tool) closed the BLE connection (it does this right after
+                // ThreadNetworkEnable). Previously this was a no-op, so the DEVICE never learned of the
+                // disconnect and kept its BLE link up forever -- and an open BLE connection monopolises the
+                // emulated EFR32 multiprotocol radio, starving 15.4 RX so operational CASE over Thread can
+                // never complete ("commissioning deadlock"). Tell the device to tear down its link via
+                // LL_TERMINATE_IND so its radio is freed for Thread.
+                this.Log(LogLevel.Warning, "BleCentralBridge: host closed BLE -> LL_TERMINATE_IND to device (free its radio for 15.4/Thread)");
+                EnqueueLlControl(new byte[] { 0x02, 0x13 }); // LL_TERMINATE_IND, reason 0x13 = remote user terminated
+                // Give the terminate a few connection events to reach the device, THEN stop our own
+                // connection-event loop. Otherwise the bridge keeps hopping + transmitting BLE connection
+                // PDUs into the shared wireless medium forever; once the device has switched to 15.4 (Thread)
+                // those stray BLE frames flood its RX and are dropped as "SYNC MISMATCH" (observed 600+ of
+                // them), degrading the Thread link so merge/operational-CASE fail. Stopping the loop frees
+                // the medium for 15.4. ScheduleAction marshals the state change onto the emulation thread
+                // (this runs on the host-socket RX thread), consistent with ConnectionEvent().
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnIntervalMicroseconds * 4), _ =>
+                {
+                    if(state == State.Connected)
+                    {
+                        state = State.Scanning;
+                        this.Log(LogLevel.Warning, "BleCentralBridge: connection torn down -> stopped BLE connection events (medium free for 15.4)");
+                    }
+                }, "ble-central-terminate");
                 break;
             default:
                 this.Log(LogLevel.Warning, "BleCentralBridge: unknown host frame type 0x{0:X2}", type);

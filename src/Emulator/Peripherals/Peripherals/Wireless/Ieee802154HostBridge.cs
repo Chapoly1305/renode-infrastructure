@@ -283,13 +283,26 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     return;
                 }
             }
-            // Half-duplex guard: if the device is transmitting, it can't receive -- defer the injection
-            // (don't dequeue) and re-check shortly, so we never inject into a device TX and lose the frame.
-            if(deviceTxInProgress)
+            // Half-duplex + RX-readiness guard: the emulated radio only accepts a frame while it is in RAC
+            // RxSearch (actively listening). If we inject while it is transmitting (its own frame or a MAC ACK
+            // for the previous frame), warming up, or still mid-RX of another frame, the frame is dropped
+            // "not in RXSEARCH" -- and because we synthesize the host-side MAC-ACK immediately (so otbr believes
+            // delivery succeeded), otbr never retransmits it. That silently loses e.g. the 2nd 6LoWPAN fragment
+            // of the Child ID Response, so Thread attach never completes. Defer (don't dequeue) until the radio
+            // is back in RxSearch so every injected fragment is truly received. deviceTxInProgress is a fast
+            // path for the known large-TX case; the RxSearch check covers ACK-TX / warm / mid-RX too.
+            if(deviceTxInProgress || !DeviceRadioReadyToReceive())
             {
-                machine.ScheduleAction(TimeInterval.FromMicroseconds(DeviceTxDeferMicroseconds), _ => PumpDeviceInject(), "ieee802154-inject-defer");
-                return;
+                if(++injectDeferCount <= MaxInjectDefers)
+                {
+                    machine.ScheduleAction(TimeInterval.FromMicroseconds(DeviceTxDeferMicroseconds), _ => PumpDeviceInject(), "ieee802154-inject-defer");
+                    return;
+                }
+                // Safety valve: after ~MaxInjectDefers*DeviceTxDeferMicroseconds the radio still isn't listening
+                // (device stuck/idle); inject best-effort rather than stall the queue forever.
+                this.Log(LogLevel.Noisy, "Ieee802154HostBridge: RxSearch gate timed out ({0} defers); injecting best-effort", injectDeferCount);
             }
+            injectDeferCount = 0;
             byte[] mpdu;
             lock(injectLock)
             {
@@ -298,6 +311,22 @@ namespace Antmicro.Renode.Peripherals.Wireless
             InjectToDevice(mpdu);
             var airUs = (ulong)(mpdu.Length + PreambleBytes) * MicrosecondsPerByte + InterFrameGapMicroseconds;
             machine.ScheduleAction(TimeInterval.FromMicroseconds(airUs), _ => PumpDeviceInject(), "ieee802154-device-inject-pump");
+        }
+
+        // Is the emulated device radio in RAC RxSearch (ready to accept an injected frame)? Resolve the radio
+        // peripheral lazily from the machine (the SiLabs_xG24_LPW sharing this medium). If it can't be found,
+        // return true so the bridge falls back to its previous unconditional-inject behaviour (never worse).
+        private bool DeviceRadioReadyToReceive()
+        {
+            if(deviceRadio == null)
+            {
+                deviceRadio = machine.GetPeripheralsOfType<SiLabs_xG24_LPW>().FirstOrDefault();
+                if(deviceRadio == null)
+                {
+                    return true;
+                }
+            }
+            return deviceRadio.IsRadioInRxSearch;
         }
 
         // ---- Host UDP transport: OpenThread "simulation" real-time virtual radio (multicast) ----------------
@@ -515,6 +544,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private readonly System.Collections.Generic.Queue<byte[]> deviceInjectQueue = new System.Collections.Generic.Queue<byte[]>();
         private bool injectPumpRunning; // true while the host->device drain pump is scheduling itself
         private volatile bool deviceTxInProgress; // true while the device is transmitting (half-duplex; can't RX)
+        private SiLabs_xG24_LPW deviceRadio; // lazily-resolved device radio, for the RxSearch injection gate
+        private int injectDeferCount; // consecutive RxSearch-gate defers for the current frame (safety-valve bound)
 
         // 802.15.4: min MPDU = FC(2)+seq(1)+FCS(2) = 5; max PSDU = 127. Sync word is a few bytes.
         private const int MinMpdu = 5;
@@ -532,8 +563,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
         // Guard gap between serialized host->device frames so the device's RX of one frame fully completes
         // (rxTimer + processing) before the next starts. A few symbol times is plenty.
         private const ulong InterFrameGapMicroseconds = 300;
-        // How often the inject pump re-checks when it finds the device mid-transmission (half-duplex defer).
+        // How often the inject pump re-checks when it finds the device mid-transmission (half-duplex defer)
+        // or not yet in RxSearch. Also the poll interval for the RxSearch injection gate.
         private const ulong DeviceTxDeferMicroseconds = 200;
+        // Safety-valve bound on RxSearch-gate defers per frame (~MaxInjectDefers*DeviceTxDeferMicroseconds of
+        // virtual time). A well-behaved rx-on device returns to RxSearch within a few ms after each TX; this
+        // just prevents a permanent queue stall if the radio never reports RxSearch.
+        private const int MaxInjectDefers = 250; // ~50ms
+
         // Only large device TX frames (data/6LoWPAN fragments) gate host->device injection; small MLE control
         // frames (~70B advertisements) do NOT, so the otbr<->device MLE attach isn't delayed past its timeouts.
         private const int kHalfDuplexGateBytes = 90;

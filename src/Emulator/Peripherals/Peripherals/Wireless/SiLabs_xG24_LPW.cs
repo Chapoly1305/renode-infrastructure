@@ -271,6 +271,88 @@ namespace Antmicro.Renode.Peripherals.Wireless
             return value;
         }
 
+        // RENODE fidelity fix -- two-core HOSTMAILBOX/RFMAILBOX doorbell deadlock at RAIL
+        // sequencer bring-up. MEASURED timeline (Quectel 5136/554, 1 ms sampling):
+        //   t=0.038  M33 takes a RAIL critical section (PRIMASK=1), writes HOSTMAILBOX.IEN=0x3,
+        //            memcpy's the sequencer image into SEQRAM, then writes RAC.CTRL bit26
+        //            (CPUWAITDIS) to release the sequencer. PRIMASK stays 1 from here on.
+        //   t=0.039  the sequencer boots, sets its OWN PRIMASK=1, rings the host doorbell
+        //            (HOSTMAILBOX.IF bit0 = 1) and spin-waits on `while(HOSTMAILBOX.IF & 1)`.
+        //   t=0.040  the M33 posts its own command (RFMAILBOX.IF bit0 = 1) and spin-waits
+        //            on RFMAILBOX.IF bit0 -- still inside the same critical section.
+        // Both doorbell interrupts are ENABLED and PENDING in the model (nvic ISPR1 bit6 =
+        // IRQ38 HOSTMAILBOX; seq ISPR bit23 = RFMAILBOX) and neither is ever taken, because
+        // BOTH cores hold PRIMASK=1; IABR stays 0 on both. RAIL never finishes init, so the
+        // image never reaches its CHIPoBLE GATT server. Same class of artifact as the RAC
+        // Storage0 livelock handled above, and resolved the same way: at the model layer,
+        // scheduler-independently.
+        //
+        // The intervention is exactly the acknowledgement the host's masked HOSTMAILBOX ISR
+        // would have performed -- clear the message flags and return 0 to the sequencer's
+        // read once it is CONFIRMED spinning on an identical, non-zero IF.
+        //
+        // Threshold: under SetGlobalSerialExecution with the default 100us quantum the
+        // sequencer runs ~3900 instructions (~1000 poll iterations) before the M33 is
+        // scheduled at all, so a small threshold would break legitimate waits the host
+        // would have answered on its next slice. 16384 is ~16 quanta (~0.4ms emulated) --
+        // unambiguous against a deadlock that spins at 39M instr/s, invisible in boot timing.
+        private const int HostMailboxDoorbellSpinThreshold = 16384;
+        private uint hostMailboxDoorbellLastRead;
+        private int hostMailboxDoorbellSpinCount;
+
+        private uint BreakHostMailboxDoorbellDeadlock(long offset, uint value)
+        {
+            if((offset & 0xFFF) != (long)HostMailboxRegisters.InterruptFlags)
+            {
+                return value;
+            }
+            // Only the SEQUENCER's poll can deadlock this way. The M33 reads the same
+            // register from its own ISR and must always be told the truth; if the reader
+            // cannot be identified, leave the value alone as well.
+            if(!machine.SystemBus.TryGetCurrentCPU(out var readingCpu) || readingCpu != sequencer)
+            {
+                return value;
+            }
+            var hostOwesAck = false;
+            for(var i = 0; i < MailboxMessageNumber; i++)
+            {
+                if(HOSTMAILBOX_messageInterrupt[i].Value && HOSTMAILBOX_messageInterruptEnable[i].Value)
+                {
+                    hostOwesAck = true;
+                    break;
+                }
+            }
+            if(!hostOwesAck || value == 0)
+            {
+                hostMailboxDoorbellSpinCount = 0;
+                return value;
+            }
+            if(value == hostMailboxDoorbellLastRead)
+            {
+                hostMailboxDoorbellSpinCount++;
+            }
+            else
+            {
+                hostMailboxDoorbellLastRead = value;
+                hostMailboxDoorbellSpinCount = 1;
+            }
+            if(hostMailboxDoorbellSpinCount < HostMailboxDoorbellSpinThreshold)
+            {
+                return value;
+            }
+            this.Log(LogLevel.Warning,
+                     "HOSTMAILBOX doorbell deadlock detected (sequencer spun {0}x on IF=0x{1:X} while the host holds PRIMASK); acknowledging on the host's behalf",
+                     hostMailboxDoorbellSpinCount, value);
+            hostMailboxDoorbellSpinCount = 0;
+            hostMailboxDoorbellLastRead = 0;
+            for(var i = 0; i < MailboxMessageNumber; i++)
+            {
+                HOSTMAILBOX_messageInterrupt[i].Value = false;
+            }
+            UpdateInterrupts();
+            return 0;
+        }
+
         [ConnectionRegionAttribute("protimer_ns")]
         public void WriteByteToProtocolTimerNonSecure(long offset, byte value)
         {
@@ -376,7 +458,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("hostmailbox")]
         public uint ReadDoubleWordFromHostMailbox(long offset)
         {
-            return Read<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX)", offset);
+            var value = Read<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX)", offset);
+            return BreakHostMailboxDoorbellDeadlock(offset, value);
         }
 
         [ConnectionRegionAttribute("rfmailbox_ns")]
@@ -400,7 +483,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("hostmailbox_ns")]
         public uint ReadDoubleWordFromHostMailboxNonSecure(long offset)
         {
-            return Read<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX_NS)", offset);
+            var value = Read<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX_NS)", offset);
+            return BreakHostMailboxDoorbellDeadlock(offset, value);
         }
 
         [ConnectionRegionAttribute("synth_ns")]

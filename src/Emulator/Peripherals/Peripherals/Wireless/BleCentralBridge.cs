@@ -137,6 +137,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             c2Handle = 0;
             c2CccdHandle = 0;
             gattReady = false;
+            discoveryStarted = false;
             machine.ScheduleAction(TimeInterval.FromMicroseconds(Anchor0DelayMicroseconds), _ => ConnectionEvent(), "ble-central-conn-event");
             // After the connection settles (LL control drains over the first few events), kick off GATT with
             // an ATT MTU exchange to validate the ATT path end-to-end.
@@ -348,10 +349,34 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var opcode = att[0];
             switch(opcode)
             {
+            case 0x02: // ATT_EXCHANGE_MTU_REQ *from the peripheral*
+                // Not every stack answers our MTU request; some open the exchange
+                // themselves. Without this case the opcode fell to `default:`,
+                // discovery was never started, and both sides waited forever --
+                // observed on Tuya firmware that was otherwise a fully booted Matter
+                // device, and which looked like a boot failure because of it.
+                // Answer, then proceed exactly as for the response path.
+                attMtu = att.Length >= 3
+                    ? Math.Min((ushort)(att[1] | (att[2] << 8)), LocalAttMtu)
+                    : LocalAttMtu;
+                SendAtt(new byte[] { 0x03, (byte)(LocalAttMtu & 0xFF), (byte)(LocalAttMtu >> 8) });
+                this.Log(LogLevel.Warning, "BleCentralBridge: peer-initiated ATT MTU exchange -> {0}; discovering CHIPoBLE service", attMtu);
+                if(!discoveryStarted)
+                {
+                    discoveryStarted = true;
+                    DiscoverChipobleService();
+                }
+                break;
             case 0x03: // ATT_EXCHANGE_MTU_RSP -> begin CHIPoBLE service discovery
                 attMtu = Math.Min((ushort)(att[1] | (att[2] << 8)), LocalAttMtu);
                 this.Log(LogLevel.Warning, "BleCentralBridge: ATT MTU exchanged -> {0}; discovering CHIPoBLE service", attMtu);
-                DiscoverChipobleService();
+                // Guarded so a peer that both requests and responds cannot start
+                // two overlapping discovery procedures.
+                if(!discoveryStarted)
+                {
+                    discoveryStarted = true;
+                    DiscoverChipobleService();
+                }
                 break;
             case 0x07: // ATT_FIND_BY_TYPE_VALUE_RSP -> CHIPoBLE (0xFFF6) primary service handle range
                 if(att.Length >= 5)
@@ -782,6 +807,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private ushort c2Handle;         // CHIPoBLE C2 (indications) value handle
         private ushort c2CccdHandle;     // C2 Client Characteristic Configuration Descriptor
         private bool gattReady;
+        private bool discoveryStarted;
         private const ushort LocalAttMtu = 247;
 
         // Our (central/initiator) random address, little-endian.

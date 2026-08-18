@@ -45,6 +45,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         {
             state = State.Scanning;
             connectIndScheduled = false;
+            connectAttempt = 0;
+            suppressReconnect = false;
         }
 
         public uint ReadDoubleWord(long offset)
@@ -76,7 +78,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 return;
             }
 
-            if(state != State.Scanning)
+            if(state != State.Scanning || suppressReconnect)
             {
                 return;
             }
@@ -108,9 +110,41 @@ namespace Antmicro.Renode.Peripherals.Wireless
             // The peripheral opens a short RX window (~T_IFS) after its ADV_IND on the SAME channel. The
             // medium delivers synchronously in virtual time, so schedule the CONNECT_IND to land inside that
             // window (~450 us after the ADV start, per the model's Tx->Tx2Rx->RxSearch timing).
+            //
+            // That constant is measured from ReceiveFrame, which fires at the sender's TX-START, so the
+            // right value depends on the ADV's air time -- i.e. on its length. Measured from the
+            // SiLabs_xG24_LPW RSM trace (add `logLevel 1 sysbus.radio` to the scenario):
+            //
+            //   Tuya 4701/79   ADV 35 B -> 284 us air; RxSearch [ADVstart+500, +600] us
+            //   LG  4142/8704  ADV 46 B -> 377 us air; RxSearch [ADVstart+613, +900] us
+            //
+            // 450 us lands at ADVstart+550 (ScheduleAction always adds one 100 us default quantum): inside
+            // Tuya's window, 13 us short of LG's, which is dropped as "not in RXSEARCH". No single constant
+            // serves both. ATTEMPT 0 THEREFORE KEEPS THE HISTORICAL CONSTANT UNCHANGED -- only a retry, which
+            // by definition means the constant did not work, switches to the air-time-derived aim and sweeps.
             connectIndScheduled = true;
             state = State.Connecting;
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnectIndDelayMicroseconds), _ => SendConnectInd(), "ble-central-connect-ind");
+            if(connectAttempt == 0)
+            {
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnectIndDelayMicroseconds), _ => SendConnectInd(), "ble-central-connect-ind");
+                return;
+            }
+            var advAirTimeUs = (frame.Length + 1) * 8;    // 1 Msym/s, 8 us/byte, + 1 preamble byte
+            var sweepStep = (connectAttempt / 2) * ConnectIndSweepStepMicroseconds;
+            if(sweepStep > ConnectIndSweepCapMicroseconds)
+            {
+                sweepStep = ConnectIndSweepCapMicroseconds;
+            }
+            var aimUs = advAirTimeUs + (int)ConnectIndAimMicroseconds - (int)SchedulerQuantumMicroseconds
+                        + ((connectAttempt % 2 == 1) ? sweepStep : -sweepStep);
+            if(aimUs < 50)
+            {
+                aimUs = 50;
+            }
+            this.Log(LogLevel.Warning,
+                "BleCentralBridge: CONNECT_IND retry {0} -- ADV {1} B ({2} us on air), aiming {3} us after ADV start",
+                connectAttempt, frame.Length, advAirTimeUs, aimUs + (int)SchedulerQuantumMicroseconds);
+            machine.ScheduleAction(TimeInterval.FromMicroseconds((ulong)aimUs), _ => SendConnectInd(), "ble-central-connect-ind");
         }
 
         private void SendConnectInd()
@@ -138,19 +172,84 @@ namespace Antmicro.Renode.Peripherals.Wireless
             c2CccdHandle = 0;
             gattReady = false;
             discoveryStarted = false;
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(Anchor0DelayMicroseconds), _ => ConnectionEvent(), "ble-central-conn-event");
+            missStreak = 0;
+            peerAnsweredLastEvent = false;
+            searchEngaged = false;
+            // currentIntervalUs and searchEverEngaged deliberately SURVIVE a reconnect: one connection only
+            // affords ~34 trials before the peripheral's own supervision timeout, which is not enough to
+            // cover the widest error measured (Tuya 4701/436, +1121 us). Continuing the sweep across
+            // reconnects covers it in a few seconds instead. Reset() clears them.
+            previousEventIntervalUs = currentIntervalUs;
+            anchorEvent = 0;
+            anchorTxUs = NowMicroseconds() + Anchor0DelayMicroseconds;
+            // A connection generation, so a timer left over from a previous connection cannot inject a stray
+            // event into this one after a rescan.
+            connectionGeneration++;
+            var generation = connectionGeneration;
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(Anchor0DelayMicroseconds), _ => ConnectionEvent(generation, currentIntervalUs), "ble-central-conn-event");
             // After the connection settles (LL control drains over the first few events), kick off GATT with
             // an ATT MTU exchange to validate the ATT path end-to-end.
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(200000), _ => SendAttMtuRequest(), "ble-central-att-mtu");
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(200000), _ => { if(generation == connectionGeneration) { SendAttMtuRequest(); } }, "ble-central-att-mtu");
         }
 
         // One connection event as the master: hop to the data channel, transmit our PDU (queued LL/L2CAP
         // data, else an empty PDU), then schedule the next event one connection interval later. The device's
         // real sl_bt responds each event; its response arrives in ReceiveFrame -> ProcessDataPdu.
-        private void ConnectionEvent()
+        private void ConnectionEvent(uint generation, double intervalThatPlacedThisEvent)
         {
-            if(state != State.Connected)
+            if(state != State.Connected || generation != connectionGeneration)
             {
+                return;
+            }
+
+            // Close the books on the PREVIOUS event, whose outcome only becomes knowable now. The peripheral
+            // answers ~T_IFS (150 us) after our transmission -- i.e. ~150 us into a 30 ms interval -- so by
+            // the time the next event starts, its answer has either arrived or it never will. Judging it at
+            // the END of the previous event, before the reply could physically have arrived, is precisely
+            // what made an earlier version of this change believe a perfectly healthy link had missed every
+            // single event. Do not move this.
+            if(connEventCounter > 0)
+            {
+                if(peerAnsweredLastEvent)
+                {
+                    // The peer heard the PREVIOUS event, which was placed by previousEventIntervalUs. If the
+                    // search was engaged, that value is the peripheral's real connection interval: adopt it
+                    // and disengage. This is the ONLY place currentIntervalUs is ever written, and it cannot
+                    // be reached unless the search was engaged, which needs SearchEngageEvents CONFIRMED
+                    // consecutive misses first.
+                    if(searchEngaged)
+                    {
+                        this.Log(LogLevel.Warning,
+                            "BleCentralBridge: peer re-acquired at event {0} -- adopting connection interval {1:F0} us (was {2:F0})",
+                            connEventCounter - 1, previousEventIntervalUs, currentIntervalUs);
+                        currentIntervalUs = previousEventIntervalUs;
+                        searchEngaged = false;
+                        searchSweepBase = 0;
+                    }
+                    missStreak = 0;
+                }
+                else
+                {
+                    missStreak++;
+                }
+            }
+            peerAnsweredLastEvent = false;
+            previousEventIntervalUs = intervalThatPlacedThisEvent;
+
+            // Bridge-side link supervision. Without it the bridge stays in State.Connected for ever:
+            // ReceiveFrame drops every ADV_IND while state != Scanning, so ONE missed CONNECT_IND or one lost
+            // link is permanent and the run simply goes silent. Every stalled image in the deployed corpus
+            // ends exactly there -- the DEVICE gives up at its own 1 s supervision timeout and goes back to
+            // advertising (RSM channel 0/12/39 in the radio trace), while the bridge keeps hopping data
+            // channels and talking to nobody. SupervisionEvents matches the 1 s SupervisionTimeout the
+            // CONNECT_IND itself advertises, so the peripheral always gives up first and is already
+            // advertising again by the time we rescan.
+            if(missStreak > SupervisionEvents)
+            {
+                this.Log(LogLevel.Warning,
+                    "BleCentralBridge: no peer PDU for {0} consecutive connection events -- link lost, rescanning (next CONNECT_IND attempt {1})",
+                    missStreak, connectAttempt + 1);
+                AbandonConnection();
                 return;
             }
 
@@ -175,9 +274,104 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 }
             }
 
+            lastTxUs = NowMicroseconds();
             SendFrame(BuildDataPdu(llid, payload));
             connEventCounter++;
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnIntervalMicroseconds), _ => ConnectionEvent(), "ble-central-conn-event");
+
+            // THE GATE. Until the link has missed SearchEngageEvents CONSECUTIVE, CONFIRMED events, this is
+            // the original line, unmodified, with the original constant. A healthy link -- and a link that
+            // drops the odd packet -- never reaches the else branch, never reads an anchor, and never writes
+            // currentIntervalUs.
+            if(missStreak < SearchEngageEvents && !searchEverEngaged)
+            {
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnIntervalMicroseconds), _ => ConnectionEvent(generation, ConnIntervalMicroseconds), "ble-central-conn-event");
+                return;
+            }
+            if(missStreak < SearchEngageEvents)
+            {
+                // The search already ran on this link: keep the interval it found, and keep timing events
+                // from the last transmission the peer actually heard rather than from our own clock, so a
+                // single missed event cannot let the two timelines walk apart.
+                ScheduleFromAnchor(generation, currentIntervalUs);
+                return;
+            }
+
+            // Engaged. The measured cause of every remaining stall is that the EMULATED peripheral's
+            // connection interval is not 30.000 ms, and the error is not always the crystal:
+            //
+            //   HEIMAN 4619/4101 (reaches GATT)  30.0000 ms  widening  -0.1 us/event  <- matched pair,
+            //   HEIMAN 4619/4097 (stalls)        30.3306 ms  widening +30.6 us/event     same board
+            //   IKEA   4476/32774                30.3304 ms   (crystal already correct)
+            //   Tuya   4701/436                  31.1209 ms   (crystal already correct)
+            //
+            // A central fixed at 30.000 ms drifts 330..1120 us per event out of a window that widens only
+            // ~30 us per event. From the last event the peer demonstrably heard, re-time event k to
+            // anchor + k * trial and step the TRIAL INTERVAL through +/-150, +/-300 ... us. Trialling an
+            // interval (not an offset) makes the offset grow with k exactly as the drift does; a fixed
+            // offset sweep cannot track it. The peripheral re-anchors on any packet it hears, so one hit
+            // both proves the interval and ends the search.
+            searchEverEngaged = true;
+            searchEngaged = true;
+            // Trial n = 0, +1, -1, +2, -2, ... steps away from the interval we currently believe in.
+            // Starting at ZERO matters: it re-tries the current interval first, so a healthy link that
+            // simply went quiet for a few events is re-acquired instead of being walked off its own grid.
+            //
+            // Step size is set by the peripheral, not by us. Its RX window half-width grows ~30 us per
+            // event since its last sync, while a wrong trial's offset grows k * error over the same k
+            // events, so it hears us iff |error| <= 30 + 40/k -- i.e. ~30 us regardless of k. A coarser
+            // step simply steps over every value that would have worked.
+            var n = searchSweepBase + (missStreak - SearchEngageEvents);
+            var trialStep = ((n + 1) / 2) * IntervalTrialStepMicroseconds;
+            if(trialStep > IntervalTrialCapMicroseconds)
+            {
+                trialStep = IntervalTrialCapMicroseconds;
+            }
+            var trialUs = currentIntervalUs + ((n % 2 == 1) ? trialStep : -trialStep);
+            this.Log(LogLevel.Debug, "BleCentralBridge: event {0}, {1} consecutive misses -- trialling interval {2:F0} us",
+                connEventCounter, missStreak, trialUs);
+            ScheduleFromAnchor(generation, trialUs);
+        }
+
+        // Place the next connection event at anchor + k * intervalUs, where the anchor is the last
+        // transmission the peer demonstrably heard. Absolute rather than relative, so missed events do not
+        // accumulate error into our own timeline.
+        private void ScheduleFromAnchor(uint generation, double intervalUs)
+        {
+            var targetUs = anchorTxUs + (connEventCounter - anchorEvent) * intervalUs;
+            var delayUs = targetUs - NowMicroseconds();
+            if(delayUs < MinimumEventDelayMicroseconds)
+            {
+                delayUs = MinimumEventDelayMicroseconds;
+            }
+            machine.ScheduleAction(TimeInterval.FromMicroseconds((ulong)delayUs), _ => ConnectionEvent(generation, intervalUs), "ble-central-conn-event");
+        }
+
+        private double NowMicroseconds()
+        {
+            return machine.ElapsedVirtualTime.TimeElapsed.TotalMicroseconds;
+        }
+
+        // Give up on this connection and go back to scanning, so the next ADV_IND -- the device is already
+        // advertising again by then -- gets a fresh CONNECT_IND with a different aim.
+        private void AbandonConnection()
+        {
+            if(missStreak > SearchEngageEvents)
+            {
+                // Carry the sweep position into the next connection attempt instead of restarting it.
+                searchSweepBase += missStreak - SearchEngageEvents;
+            }
+            state = State.Scanning;
+            connectIndScheduled = false;
+            connectAttempt++;
+            missStreak = 0;
+            peerAnsweredLastEvent = false;
+            gattReady = false;
+            discoveryStarted = false;
+            l2capReassembly = null;
+            lock(txLock)
+            {
+                txQueue.Clear();
+            }
         }
 
         // BLE Channel Selection Algorithm #1 (all 37 data channels enabled -> mapped == unmapped).
@@ -212,6 +406,20 @@ namespace Antmicro.Renode.Peripherals.Wireless
         // Process a received connection data PDU: LL acknowledgement (SN/NESN) + dispatch payload.
         private void ProcessDataPdu(byte[] frame)
         {
+            // Any PDU on our access address means the peer heard the packet we just sent: a BLE peripheral
+            // only ever transmits in reply to its master inside a connection event. Recorded here and acted
+            // on at the START of the next event (see ConnectionEvent); nothing about the current event's
+            // scheduling depends on it.
+            peerAnsweredLastEvent = true;
+            connectAttempt = 0;
+            if(connEventCounter > 0)
+            {
+                // The anchor: the last transmission the peer demonstrably heard. Written unconditionally
+                // because it is cheap; read only by the engaged search path.
+                anchorTxUs = lastTxUs;
+                anchorEvent = connEventCounter - 1;
+            }
+
             var header0 = frame[4];
             var len = frame[5];
             var llid = header0 & 0x03;
@@ -284,6 +492,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             case 0x02: // LL_TERMINATE_IND
                 this.Log(LogLevel.Warning, "BleCentralBridge: peer terminated the connection (reason 0x{0:X2})", p.Length > 1 ? p[1] : 0);
                 state = State.Scanning;
+                suppressReconnect = true;
                 break;
             default:   // anything we don't implement -> LL_UNKNOWN_RSP
                 EnqueueLlControl(new byte[] { 0x07, opcode });
@@ -629,6 +838,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 // never complete ("commissioning deadlock"). Tell the device to tear down its link via
                 // LL_TERMINATE_IND so its radio is freed for Thread.
                 this.Log(LogLevel.Warning, "BleCentralBridge: host closed BLE -> LL_TERMINATE_IND to device (free its radio for 15.4/Thread)");
+                // Deliberate teardown: the rescan above must NOT fire, or the bridge would re-seize the
+                // device's shared radio and recreate the commissioning deadlock this handler exists to avoid.
+                suppressReconnect = true;
                 EnqueueLlControl(new byte[] { 0x02, 0x13 }); // LL_TERMINATE_IND, reason 0x13 = remote user terminated
                 // Give the terminate a few connection events to reach the device, THEN stop our own
                 // connection-event loop. Otherwise the bridge keeps hopping + transmitting BLE connection
@@ -795,6 +1007,21 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private int centralNesn;            // next sequence number we expect from the peer
         private bool lastSentWasData;       // whether our last TX carried a queued (ackable) PDU
         private bool versionSent;
+
+        // Link-supervision state. All of it is write-only on a healthy link except missStreak, which stays 0.
+        private bool peerAnsweredLastEvent;  // set by ProcessDataPdu, consumed at the start of the next event
+        private uint missStreak;             // CONFIRMED consecutive events with no reply
+        private uint connectionGeneration;   // bumped per connection; stale timers check it and return
+        private int connectAttempt;          // CONNECT_INDs sent since the peer last answered
+        private bool suppressReconnect;      // link was torn down on purpose; do not re-connect
+        private bool searchEngaged;          // a trial interval is in flight
+        private bool searchEverEngaged;      // the search has run at least once on this connection
+        private double currentIntervalUs = ConnIntervalMicroseconds;
+        private double previousEventIntervalUs = ConnIntervalMicroseconds;
+        private double anchorTxUs;           // virtual time (us) of the last transmission the peer heard
+        private double lastTxUs;             // virtual time (us) of our most recent transmission
+        private uint anchorEvent;            // connEventCounter index of that transmission
+        private uint searchSweepBase;        // trials already tried on earlier connections
         private readonly System.Collections.Generic.Queue<TxItem> txQueue = new System.Collections.Generic.Queue<TxItem>();
         private static readonly byte[] EmptyPayload = new byte[0];
 
@@ -830,6 +1057,21 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private const ushort ConnInterval = 0x0018;              // 24 * 1.25ms = 30ms
         private const ushort SupervisionTimeout = 0x0064;        // 100 * 10ms = 1s
         private const byte HopIncrement = 0x07;                  // 5..16
+
+        // Supervision / CONNECT_IND-retry tuning. SupervisionEvents * 30 ms = 1.02 s, just past the 1 s
+        // SupervisionTimeout the CONNECT_IND advertises. ConnectIndAim is microseconds after the END of the
+        // ADV; SchedulerQuantumMicroseconds is TimeSourceBase.DefaultQuantum, which ScheduleAction adds.
+        private const uint SupervisionEvents = 34;
+        private const ulong ConnectIndAimMicroseconds = 275;
+        private const ulong SchedulerQuantumMicroseconds = 100;
+        private const int ConnectIndSweepStepMicroseconds = 60;
+        private const int ConnectIndSweepCapMicroseconds = 300;
+        // The gate: consecutive CONFIRMED misses before the interval search may engage at all. A healthy
+        // link sits at missStreak == 0; the corpus's booting images never exceed 1.
+        private const uint SearchEngageEvents = 4;
+        private const double IntervalTrialStepMicroseconds = 30.0;
+        private const double IntervalTrialCapMicroseconds = 1500.0;
+        private const double MinimumEventDelayMicroseconds = 100.0;
 
         // Host CHIPoBLE socket (chip-tool's fake C1/C2 frame transport connects here).
         private const byte HostFrameConnect = 0x01;

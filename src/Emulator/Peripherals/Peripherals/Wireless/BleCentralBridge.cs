@@ -361,6 +361,18 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 searchSweepBase += missStreak - SearchEngageEvents;
             }
             state = State.Scanning;
+            // Put the receiver back on an ADVERTISING channel. ConnectionEvent hops
+            // Channel across the 37 data channels via DataChannelToRf, which maps
+            // 0..36 -> 1..11,13..38 and can therefore NEVER return 0, 12 or 39 -- the
+            // only three channels a peripheral advertises on. WirelessMedium delivers
+            // a frame only when receiver.Channel == sender.Channel, so a bridge left
+            // parked on a data channel is deaf to every subsequent ADV_IND and
+            // "rescanning" never rescans. It is also the TX side: the next CONNECT_IND
+            // would go out on a channel nobody is listening to.
+            // Measured across all 106 corpus workspaces before this fix: not one log
+            // contained a second accepted ADV_IND, and the CONNECT_IND retry below had
+            // never executed in any run.
+            Channel = 0;
             connectIndScheduled = false;
             connectAttempt++;
             missStreak = 0;

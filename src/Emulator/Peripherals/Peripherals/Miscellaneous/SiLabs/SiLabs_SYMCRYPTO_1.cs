@@ -7,6 +7,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
@@ -39,6 +40,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             base.Reset();
 
             currentDigestEngine = null;
+            currentHashByteCount = 0;
         }
 
         public GPIO IRQ { get; }
@@ -1037,6 +1039,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             if(currentDigestEngine == null)
             {
                 currentDigestEngine = CreateHashEngine(mode);
+                // The byte count belongs to the engine: start it with the engine, so a
+                // sequence abandoned before its HASH_FINAL (e.g. the hash-mode mismatch
+                // bail-out below) cannot leak a stale count into the next sequence and
+                // silently break the padding reconstruction.
+                currentHashByteCount = 0;
             }
             else
             {
@@ -1049,17 +1056,60 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 }
             }
 
-            // DATA input descriptor with type "Message" are input payload. 
+            // DATA input descriptor with type "Message" are input payload.
             // Note, for update operations an input descriptor of type "InitializationData" is passed in.
             // Since we are keeping the digest engine around, we can ignore that.
-            for(int inputIndex = 0; inputIndex < fetcherDescriptorList.Count; inputIndex++)
+            //
+            // Skip non-message descriptors: the HMAC branch above already filters on
+            // DataType == CryptoDataType.Message, and the comment above says InitializationData
+            // descriptors "can be ignored" -- but the code used to feed them into the digest,
+            // hashing the model's own non-final writeback bytes (0xF4) and corrupting every
+            // multi-step digest.
+            var messageDescriptors = fetcherDescriptorList
+                .Where(d => d.IsData && d.DataType == CryptoDataType.Message)
+                .ToList();
+
+            // On a final op in software-padding mode, the SDK driver appends the explicit
+            // padding block ({0x80, zeros, bit-length}) as an extra trailing Message
+            // descriptor; feeding it to BouncyCastle and then calling DoFinal pads TWICE.
+            // Identify it by reconstructing the exact padding block for the real bytes seen so
+            // far and comparing byte-for-byte -- NOT by checking only the first byte, which
+            // also matches legitimate message data that happens to start with 0x80 (e.g. a
+            // one-shot hash of the single byte 0x80).
+            //
+            // Hardware-padding ops (Padding=1) never carry an explicit padding descriptor, so
+            // they are excluded outright: on a real device most one-shot hashes take that path
+            // and every one of their message descriptors is real data.
+            DmaDescriptor paddingDescriptor = null;
+            if(hashFinal && !padding && messageDescriptors.Count > 0)
             {
-                if(fetcherDescriptorList[inputIndex].IsData)
+                var candidate = messageDescriptors[messageDescriptors.Count - 1];
+                var candidateLength = ValidDataLength(candidate);
+                ulong precedingBytes = currentHashByteCount;
+                for(int i = 0; i < messageDescriptors.Count - 1; i++)
                 {
-                    for(uint i = 0; i < fetcherDescriptorList[inputIndex].Length; i++)
-                    {
-                        currentDigestEngine.Update(fetcherDescriptorList[inputIndex].Data[i]);
-                    }
+                    precedingBytes += ValidDataLength(messageDescriptors[i]);
+                }
+                var expectedPadding = ComputeHashPadding(mode, precedingBytes);
+                if(expectedPadding != null
+                   && candidateLength == (uint)expectedPadding.Length
+                   && candidate.Data.Take((int)candidateLength).SequenceEqual(expectedPadding))
+                {
+                    paddingDescriptor = candidate;
+                }
+            }
+
+            foreach(var descriptor in messageDescriptors)
+            {
+                if(descriptor == paddingDescriptor)
+                {
+                    continue;
+                }
+                var validLength = ValidDataLength(descriptor);
+                for(uint i = 0; i < validLength; i++)
+                {
+                    currentDigestEngine.Update(descriptor.Data[i]);
+                    currentHashByteCount++;
                 }
             }
 
@@ -1086,6 +1136,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                     outDataOffset += bytesToWrite;
                 }
                 currentDigestEngine = null;
+                currentHashByteCount = 0;
             }
             else
             {
@@ -1429,6 +1480,82 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             return ret;
         }
 
+        // Number of real message bytes in a data descriptor. The fetcher transfers whole
+        // words, and InvalidBytesOrBits counts the trailing bytes of that transfer which are
+        // alignment padding rather than message. The AES key path already accounts for this
+        // (Length - InvalidBytesOrBits) and so does the CMAC payload path, but the hash path
+        // did not: a 1-byte message delivered as a 4-byte descriptor with
+        // InvalidBytesOrBits=3 was hashed as 4 bytes, giving sha256(80 00 00 00) instead of
+        // sha256(80).
+        private static uint ValidDataLength(DmaDescriptor descriptor)
+        {
+            return descriptor.InvalidBytesOrBits >= descriptor.Length
+                ? 0
+                : descriptor.Length - descriptor.InvalidBytesOrBits;
+        }
+
+        // Reconstructs the Merkle-Damgard padding block (0x80, zero fill, then the message
+        // bit-length) that a real message of messageLengthBytes would receive under the given
+        // hash mode. Used to identify the SDK driver's explicit software-padding descriptor by
+        // exact content match rather than by its leading byte alone -- a leading-0x80 test also
+        // matches legitimate message data (e.g. a one-shot hash of the single byte 0x80).
+        //
+        // Returns null for a mode whose padding rule is not modelled here; the caller then
+        // skips nothing, which is exactly the pre-existing behaviour. A reconstruction that is
+        // wrong for some mode therefore cannot corrupt a digest that is correct today: it can
+        // only fail to match.
+        //
+        // Verified byte-exact against python hashlib for SHA-256 (all six SDK-probe cases);
+        // the other modes follow the same standard construction but have no probe coverage.
+        private static byte[] ComputeHashPadding(HashMode mode, ulong messageLengthBytes)
+        {
+            int blockSize;
+            int lengthFieldSize;
+            bool bigEndianLength;
+
+            switch(mode)
+            {
+            case HashMode.Md5:
+                // MD5 is the one supported mode with a little-endian length field.
+                blockSize = 64;
+                lengthFieldSize = 8;
+                bigEndianLength = false;
+                break;
+            case HashMode.Sha_1:
+            case HashMode.Sha_224:
+            case HashMode.Sha_256:
+            case HashMode.Sm3:
+                blockSize = 64;
+                lengthFieldSize = 8;
+                bigEndianLength = true;
+                break;
+            case HashMode.Sha_384:
+            case HashMode.Sha_512:
+                blockSize = 128;
+                lengthFieldSize = 16;
+                bigEndianLength = true;
+                break;
+            default:
+                return null;
+            }
+
+            var padding = new List<byte> { 0x80 };
+            while((messageLengthBytes + (ulong)padding.Count + (ulong)lengthFieldSize) % (ulong)blockSize != 0)
+            {
+                padding.Add(0x00);
+            }
+
+            var lengthBytes = new byte[lengthFieldSize];
+            var bitLength = messageLengthBytes * 8;
+            for(int i = 0; i < 8; i++)
+            {
+                lengthBytes[bigEndianLength ? lengthFieldSize - 1 - i : i] = (byte)(bitLength >> (8 * i));
+            }
+            padding.AddRange(lengthBytes);
+
+            return padding.ToArray();
+        }
+
         private IFlagRegisterField fetcherErrorInterruptEnable;
         // Triggered when reaching a block with Stop=1 (or end of direct transfer)
         private IFlagRegisterField pusherStoppedInterrupt;
@@ -1453,6 +1580,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
         // The solution is to keep around the hash engine until the HASH_FINAL command is called,
         // but this requires all these commands to happen sequentially.
         private IDigest currentDigestEngine = null;
+        // Real (Message-type) bytes fed to currentDigestEngine so far across this sequence of
+        // HASH_UPDATE/HASH_FINAL operations; used to reconstruct the expected SHA-256 padding
+        // block byte-for-byte instead of guessing from a leading 0x80.
+        private ulong currentHashByteCount = 0;
         // Direct mode: written by SW (address of the first data)
         // Scatter/gather mode: Written by SW (address of first descriptor). Afterwards, it is updated 
         //                      by the hardware after each processed descriptor.

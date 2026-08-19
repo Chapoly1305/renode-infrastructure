@@ -1054,7 +1054,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             // Since we are keeping the digest engine around, we can ignore that.
             for(int inputIndex = 0; inputIndex < fetcherDescriptorList.Count; inputIndex++)
             {
-                if(fetcherDescriptorList[inputIndex].IsData)
+                // Skip non-message descriptors: the HMAC branch above already filters on
+                // DataType == CryptoDataType.Message, and the comment above this loop says
+                // InitializationData descriptors "can be ignored" -- but the code fed them
+                // into the digest, hashing the model's own non-final writeback bytes (0xF4)
+                // and corrupting every multi-step digest.
+                //
+                // Also skip the explicit SHA padding block the driver sends as a Message
+                // descriptor on the final op ({0x80, zeros, bit-length}): feeding it to
+                // BouncyCastle and then calling DoFinal pads TWICE.
+                var data = fetcherDescriptorList[inputIndex].Data;
+                var isPadding = hashFinal && data.Length > 0 && data[0] == 0x80;
+                if(fetcherDescriptorList[inputIndex].IsData
+                   && fetcherDescriptorList[inputIndex].DataType == CryptoDataType.Message
+                   && !isPadding)
                 {
                     for(uint i = 0; i < fetcherDescriptorList[inputIndex].Length; i++)
                     {

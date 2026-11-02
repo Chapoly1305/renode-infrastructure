@@ -1,7 +1,8 @@
 {
   "baseline": "3bfa03fafad9fb70dd705b65f2e435c0bbde4de1",
   "branch": "integration/stock-ble-on-silabs-26q3",
-  "promotion_status": "CANDIDATE_PENDING_BUILD_AND_REGRESSION",
+  "promotion_status": "BUILDS_AND_COMPONENT_TESTS_PASS_PENDING_FIRMWARE_E2E",
+  "validation": {"consumer": "Chapoly1305/renode integration/stock-ble-on-silabs-26q3", "build": "PASS", "SYMCRYPTO_vectors": 14, "SecureElement_SEMAILBOX2_vectors": 30, "xg24_PROTIMER_tests": 5, "SYSRTC1_regression_tests": 2, "board_and_bridge_load_reset": "PASS", "pending": ["custom SEMAILBOX1 TXINT flow-control assertions", "bridge frame transfer and reset with active traffic", "firmware commissioning, Thread attach and operational Invoke/Read", "shadow-register and Storage0 compensation relevance"]},
   "commits": [
     {"original": "0d3d7dd37d4df941c0c8852861678ae95bce2bb6", "decision": "PARTIAL", "retained": ["BleCentralBridge", "legacy unhandled RF-register shadow/reset support"], "superseded": ["SecureElement implementation: upstream now implements HMAC/signature/CCM/hash raw-state handling", "old PROTIMER single-field swept comparisons: preserve upstream BASE/WRAP combination and scheduling", "TX request typo: already fixed upstream"], "validation_required": ["SECURE engine crypto vectors", "PROTIMER", "stock BLE commissioning", "review shadow-register applicability against upstream modelled registers"]},
     {"original": "5b69bff1fffd", "decision": "RETAIN", "retained": ["SEMAILBOX TXINT space-available flow control", "SYSRTC wrap-distance comparator selection and Value-before-Enabled ordering"], "validation_required": ["SE mailbox multiword commands", "SYSRTC wrap boundary"]},

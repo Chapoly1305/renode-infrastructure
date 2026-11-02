@@ -698,9 +698,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
         // entry is removed shortly after, once the receiver has consumed it (delivery is same-virtual-time).
         private void SendFrame(byte[] pdu)
         {
-            InterferenceQueue.Add(this, RadioPhyId.Phy_BLE_2_4GHz_GFSK, Channel, 0, pdu);
+            var signature = new PhySignature(RadioModulationFamily.Fsk, RadioSymbolCoding.Nrz,
+                1000000, 0, 0, 0, 1); // BLE LE 1M, uncoded.
+            InterferenceQueue.Add(this, signature, Channel, 0, pdu);
             FrameSent?.Invoke(this, pdu);
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(FrameOnAirMicroseconds), _ => InterferenceQueue.Remove(this), "ble-central-tx-done");
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(FrameOnAirMicroseconds), _ => InterferenceQueue.Remove(this, transmissionCompleted: true), "ble-central-tx-done");
         }
 
         // Build a CONNECT_IND PDU framed for the medium: [AA=0x8E89BED6 LE][header(2)][InitA(6)][AdvA(6)][LLData(22)][CRC(3)].

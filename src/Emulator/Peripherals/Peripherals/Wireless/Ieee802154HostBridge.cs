@@ -57,6 +57,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         public void Reset()
         {
             learnedSync = null;
+            learnedPhySignature = null;
         }
 
         public uint ReadDoubleWord(long offset)
@@ -93,6 +94,15 @@ namespace Antmicro.Renode.Peripherals.Wireless
             }
 
             var phr = frame[n];
+            // Learn the register-derived PHY alongside the sync word rather than
+            // guessing DSSS settings or accepting coincidentally framed BLE traffic.
+            if(!InterferenceQueue.TryGetTxSignature(sender, out var signature)
+                || signature.ModulationFamily != RadioModulationFamily.Oqpsk
+                || signature.Coding != RadioSymbolCoding.Dsss)
+            {
+                return;
+            }
+            learnedPhySignature = signature;
             var mpdu = new byte[phr];
             Array.Copy(frame, n + 1, mpdu, 0, phr);
 
@@ -195,7 +205,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             {
                 return;
             }
-            if(learnedSync == null)
+            if(learnedSync == null || !learnedPhySignature.HasValue)
             {
                 // We haven't seen a device transmission yet, so we don't know the PHY sync word to prepend.
                 // In Thread attach the device always transmits first (MLE Parent Request / MAC beacon
@@ -223,7 +233,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             // synthesized ACK) rather than letting one removal clobber the other's still-in-flight entry.
             if(inFlightInjections++ == 0)
             {
-                InterferenceQueue.Add(this, RadioPhyId.Phy_802154_2_4GHz_OQPSK, Channel, 0, frame);
+                InterferenceQueue.Add(this, learnedPhySignature.Value, Channel, 0, frame);
             }
             FrameSent?.Invoke(this, frame);
             machine.ScheduleAction(TimeInterval.FromMicroseconds(FrameOnAirMicroseconds), _ => EndInjection(), "ieee802154-tx-done");
@@ -241,7 +251,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         {
             try
             {
-                InterferenceQueue.Remove(this);
+                InterferenceQueue.Remove(this, transmissionCompleted: true);
             }
             catch(Exception e)
             {
@@ -538,6 +548,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private IPEndPoint groupEndpoint;
         private Thread rxThread;
         private byte[] learnedSync;
+        private PhySignature? learnedPhySignature;
         private readonly object txLock = new object();
         private int inFlightInjections; // reference count for the single per-sender InterferenceQueue entry
         private readonly object injectLock = new object();

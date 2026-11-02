@@ -3708,15 +3708,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 return;
             }
 
-            // Real hardware advances the base counter one tick at a time and a compare channel asserts
-            // its match the moment BASECNT equals CC.BASE. This lightweight model advances the counter in
-            // one bulk step (`increment` PRECNT overflows at once), so a strict `==` on the endpoint would
-            // MISS any compare target the counter jumped over -- which made a periodic advertising compare
-            // fire only ONCE (after the first event the bulk endpoint overshoots the target every batch).
-            // Fire on the swept RANGE instead. PROTIMER_ComputeTimerLimit clamps `increment` to at most
-            // (baseCounterTop - baseCounterValue), so the counter never wraps within a single increment and
-            // the swept-through values are exactly (previousBaseCounterValue, PROTIMER_baseCounterValue].
-            var previousBaseCounterValue = PROTIMER_baseCounterValue;
             PROTIMER_baseCounterValue += (ushort)increment;
 
             // BASECNT == BASECNTTOP is only observable here, before the counter rolls over.
@@ -3764,11 +3755,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 return;
             }
 
-            // Fire wrap-compare matches on the swept RANGE, not just the bulk endpoint -- same reasoning as
-            // PROTIMER_IncrementBaseCounter (ComputeTimerLimit clamps `increment` to at most
-            // (wrapCounterTop - wrapCounterValue), so the swept values are
-            // (previousWrapCounterValue, PROTIMER_wrapCounterValue] with no wrap inside one increment).
-            var previousWrapCounterValue = PROTIMER_wrapCounterValue;
             PROTIMER_wrapCounterValue += increment;
 
             for(var i = 0; i < PROTIMER_NumberOfCaptureCompareChannels; ++i)

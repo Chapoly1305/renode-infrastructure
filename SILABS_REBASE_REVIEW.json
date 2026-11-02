@@ -1,0 +1,15 @@
+{
+  "baseline": "3bfa03fafad9fb70dd705b65f2e435c0bbde4de1",
+  "branch": "integration/stock-ble-on-silabs-26q3",
+  "promotion_status": "CANDIDATE_PENDING_BUILD_AND_REGRESSION",
+  "commits": [
+    {"original": "0d3d7dd37d4df941c0c8852861678ae95bce2bb6", "decision": "PARTIAL", "retained": ["BleCentralBridge", "legacy unhandled RF-register shadow/reset support"], "superseded": ["SecureElement implementation: upstream now implements HMAC/signature/CCM/hash raw-state handling", "old PROTIMER single-field swept comparisons: preserve upstream BASE/WRAP combination and scheduling", "TX request typo: already fixed upstream"], "validation_required": ["SECURE engine crypto vectors", "PROTIMER", "stock BLE commissioning", "review shadow-register applicability against upstream modelled registers"]},
+    {"original": "5b69bff1fffd", "decision": "RETAIN", "retained": ["SEMAILBOX TXINT space-available flow control", "SYSRTC wrap-distance comparator selection and Value-before-Enabled ordering"], "validation_required": ["SE mailbox multiword commands", "SYSRTC wrap boundary"]},
+    {"original": "bc2ff8131b00", "decision": "RETAIN", "retained": ["Ieee802154HostBridge", "bridge interference-queue reference counting"], "validation_required": ["802.15.4 TX/RX and framing", "network isolation"]},
+    {"original": "7f07a5f2f3bb", "decision": "RETAIN_WITH_MODEL_LIMIT", "retained": ["local ACK synthesis across real and virtual time domains"], "limit": "Not evidence of real MAC-ACK timing fidelity", "validation_required": ["Thread attach", "ACK ordering"]},
+    {"original": "9f035edb419c", "decision": "RETAIN_ADAPTED", "retained": ["MCUEM1PMODE write callback", "serialized host injection"], "adaptation": "Keep upstream MCUEM1PDISSWREQ register field rather than reverting to tag", "validation_required": ["EM1P handshake", "operational CASE"]},
+    {"original": "d178a8951f2a", "decision": "RETAIN_WITH_MODEL_LIMIT", "retained": ["RxSearch-gated injection", "BLE disconnect releases radio", "Storage0 serial-scheduler compensation"], "limit": "Storage0 read compensation and synthetic ACKs require disclosure; upstream scheduler changes could make compensation obsolete", "validation_required": ["fragment reassembly", "BLE-to-Thread transition", "uninstrumented Invoke and Read"]}
+  ],
+  "not_included": ["Sibling hash-patch branch: upstream engine was rewritten; test before importing any remaining semantics", "local mw-emu overlays and diagnostics: not part of six-commit fork delta", "pseudo_rng development branch", "MG21 feature branches"],
+  "tlib": {"commit": "43a51de2aa1b05fdfd2073681b9b027af555422c", "source": "SiliconLabsSoftware/renode-tlib", "reason": "Match upstream 26q3 gitlink; do not substitute old MG21 tlib"}
+}

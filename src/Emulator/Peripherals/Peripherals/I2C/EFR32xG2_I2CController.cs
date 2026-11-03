@@ -38,8 +38,9 @@ namespace Antmicro.Renode.Peripherals.I2C
                 {(long)Registers.ReceiveBufferDoubleDataPeek, GenerateReceiveBufferDoubleDataPeekRegister()},
                 {(long)Registers.TransmitBufferData, GenerateTransmitBufferDataRegister()},
                 {(long)Registers.TransmitBufferDoubleData, GenerateTransmitBufferDoubleDataRegister()},
-                {(long)Registers.InterruptFlag, GenerateInterruptFlagRegister()},
+                {(long)Registers.InterruptFlag, GenerateInterruptFlagRegister(maskByEnable: false)},
                 {(long)Registers.InterruptEnable, GenerateInterruptEnableRegister()},
+                {(long)Registers.InterruptFlagSet, GenerateInterruptFlagSetRegister()},
                 {(long)Registers.InterruptFlagClear, GenerateInterruptFlagClearRegister()},
             };
             registers = new DoubleWordRegisterCollection(this, map);
@@ -47,12 +48,41 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         public uint ReadDoubleWord(long offset)
         {
-            return registers.Read(offset);
+            return registers.Read(offset & 0xFFF);
         }
 
         public void WriteDoubleWord(long offset, uint value)
         {
-            registers.Write(offset, value);
+            var address = offset & 0xFFF;
+            var operation = offset & 0x3000;
+            if(address == (long)Registers.InterruptFlag && operation != 0)
+            {
+                // IF uses flag-specific set/clear registers. A generic RMW on
+                // the base W1C register would clear unrelated pending events.
+                var pending = registers.Read(address);
+                if(operation == 0x2000 || operation == 0x3000)
+                {
+                    registers.Write((long)Registers.InterruptFlagClear, operation == 0x3000 ? value & pending : value);
+                }
+                if(operation == 0x1000 || operation == 0x3000)
+                {
+                    registers.Write((long)Registers.InterruptFlagSet, operation == 0x3000 ? value & ~pending : value);
+                }
+                return;
+            }
+            switch(operation)
+            {
+            case 0x1000:
+                value |= registers.Read(address);
+                break;
+            case 0x2000:
+                value = registers.Read(address) & ~value;
+                break;
+            case 0x3000:
+                value ^= registers.Read(address);
+                break;
+            }
+            registers.Write(address, value);
         }
 
         public override void Reset()
@@ -82,6 +112,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             TransmitBufferDoubleData = 0x38,
             InterruptFlag = 0x3C,
             InterruptEnable = 0x40,
+            InterruptFlagSet = 0x103C,
             InterruptFlagClear = 0x203C
         }
     }

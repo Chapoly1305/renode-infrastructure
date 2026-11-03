@@ -44,9 +44,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         public void Reset()
         {
-            state = State.Scanning;
-            connectIndScheduled = false;
-            Channel = AdvertisingChannel37;
+            AbandonConnection();
+            connectAttempt = 0;
+            suppressReconnect = false;
+            searchEngaged = false;
+            searchEverEngaged = false;
+            searchSweepBase = 0;
+            currentIntervalUs = ConnIntervalMicroseconds;
         }
 
         public uint ReadDoubleWord(long offset)
@@ -78,7 +82,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 return;
             }
 
-            if(state != State.Scanning)
+            if(state != State.Scanning || suppressReconnect || frame.Length < 12)
             {
                 return;
             }
@@ -110,9 +114,25 @@ namespace Antmicro.Renode.Peripherals.Wireless
             // The peripheral opens a short RX window (~T_IFS) after its ADV_IND on the SAME channel. The
             // medium delivers synchronously in virtual time, so schedule the CONNECT_IND to land inside that
             // window (~450 us after the ADV start, per the model's Tx->Tx2Rx->RxSearch timing).
-            connectIndScheduled = true;
             state = State.Connecting;
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnectIndDelayMicroseconds), _ => SendConnectInd(), "ble-central-connect-ind");
+            var generation = connectionGeneration;
+            var delayUs = ConnectIndDelayMicroseconds;
+            if(connectAttempt > 0)
+            {
+                // Retry within the post-advertisement receive window. Preserve
+                // the existing bounded 60us aim sweep from the local runtime.
+                var sweep = Math.Min(connectAttempt / 2 * 60, 300);
+                var retryDelay = (frame.Length + 1) * 8 + 275 - 100
+                    + (connectAttempt % 2 == 1 ? sweep : -sweep);
+                delayUs = (ulong)Math.Max(50, retryDelay);
+            }
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(delayUs), _ =>
+            {
+                if(generation == connectionGeneration && state == State.Connecting)
+                {
+                    SendConnectInd();
+                }
+            }, "ble-central-connect-ind");
         }
 
         private void SendConnectInd()
@@ -139,19 +159,67 @@ namespace Antmicro.Renode.Peripherals.Wireless
             c2Handle = 0;
             c2CccdHandle = 0;
             gattReady = false;
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(Anchor0DelayMicroseconds), _ => ConnectionEvent(), "ble-central-conn-event");
+            discoveryStarted = false;
+            missStreak = 0;
+            peerAnsweredLastEvent = false;
+            searchEngaged = false;
+            previousEventIntervalUs = currentIntervalUs;
+            anchorEvent = 0;
+            anchorTxUs = NowMicroseconds() + Anchor0DelayMicroseconds;
+            connectionGeneration++;
+            var generation = connectionGeneration;
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(Anchor0DelayMicroseconds), _ => ConnectionEvent(generation, currentIntervalUs), "ble-central-conn-event");
             // After the connection settles (LL control drains over the first few events), kick off GATT with
             // an ATT MTU exchange to validate the ATT path end-to-end.
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(200000), _ => SendAttMtuRequest(), "ble-central-att-mtu");
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(200000), _ =>
+            {
+                if(generation == connectionGeneration)
+                {
+                    SendAttMtuRequest();
+                }
+            }, "ble-central-att-mtu");
         }
 
         // One connection event as the master: hop to the data channel, transmit our PDU (queued LL/L2CAP
         // data, else an empty PDU), then schedule the next event one connection interval later. The device's
         // real sl_bt responds each event; its response arrives in ReceiveFrame -> ProcessDataPdu.
-        private void ConnectionEvent()
+        private void ConnectionEvent(uint generation, double intervalThatPlacedThisEvent)
         {
-            if(state != State.Connected)
+            if(state != State.Connected || generation != connectionGeneration)
             {
+                return;
+            }
+
+            // Evaluate the previous event only after its response window. Doing
+            // this at TX time falsely classifies a healthy link as missed.
+            if(connEventCounter > 0)
+            {
+                if(peerAnsweredLastEvent)
+                {
+                    if(searchEngaged)
+                    {
+                        this.Log(LogLevel.Warning,
+                            "BleCentralBridge: peer re-acquired at event {0} -- adopting connection interval {1:F0} us (was {2:F0})",
+                            connEventCounter - 1, previousEventIntervalUs, currentIntervalUs);
+                        currentIntervalUs = previousEventIntervalUs;
+                        searchEngaged = false;
+                        searchSweepBase = 0;
+                    }
+                    missStreak = 0;
+                }
+                else
+                {
+                    missStreak++;
+                }
+            }
+            peerAnsweredLastEvent = false;
+            previousEventIntervalUs = intervalThatPlacedThisEvent;
+            if(missStreak > SupervisionEvents)
+            {
+                this.Log(LogLevel.Warning,
+                    "BleCentralBridge: no peer PDU for {0} consecutive connection events -- link lost, rescanning (next CONNECT_IND attempt {1})",
+                    missStreak, connectAttempt + 1);
+                AbandonConnection();
                 return;
             }
 
@@ -176,9 +244,61 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 }
             }
 
+            lastTxUs = NowMicroseconds();
             SendFrame(BuildDataPdu(llid, payload));
             connEventCounter++;
-            machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnIntervalMicroseconds), _ => ConnectionEvent(), "ble-central-conn-event");
+            if(missStreak < SearchEngageEvents && !searchEverEngaged)
+            {
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnIntervalMicroseconds), _ => ConnectionEvent(generation, ConnIntervalMicroseconds), "ble-central-conn-event");
+                return;
+            }
+            if(missStreak < SearchEngageEvents)
+            {
+                ScheduleFromAnchor(generation, currentIntervalUs);
+                return;
+            }
+            // Compatibility with clock-skewed emulated peripherals: bounded
+            // interval search, engaged only after four confirmed misses. This is
+            // a central-side scheduling compensation, not BLE timing fidelity.
+            searchEverEngaged = true;
+            searchEngaged = true;
+            var n = searchSweepBase + missStreak - SearchEngageEvents;
+            var step = Math.Min(((n + 1) / 2) * 30.0, 1500.0);
+            var trialUs = currentIntervalUs + (n % 2 == 1 ? step : -step);
+            ScheduleFromAnchor(generation, trialUs);
+        }
+
+        private void ScheduleFromAnchor(uint generation, double intervalUs)
+        {
+            var targetUs = anchorTxUs + (connEventCounter - anchorEvent) * intervalUs;
+            var delayUs = Math.Max(100.0, targetUs - NowMicroseconds());
+            machine.ScheduleAction(TimeInterval.FromMicroseconds((ulong)delayUs), _ => ConnectionEvent(generation, intervalUs), "ble-central-conn-event");
+        }
+
+        private double NowMicroseconds()
+        {
+            return machine.ElapsedVirtualTime.TimeElapsed.TotalMicroseconds;
+        }
+
+        private void AbandonConnection()
+        {
+            if(missStreak > SearchEngageEvents)
+            {
+                searchSweepBase += missStreak - SearchEngageEvents;
+            }
+            connectionGeneration++;
+            state = State.Scanning;
+            Channel = AdvertisingChannel37;
+            connectAttempt++;
+            missStreak = 0;
+            peerAnsweredLastEvent = false;
+            gattReady = false;
+            discoveryStarted = false;
+            l2capReassembly = null;
+            lock(txLock)
+            {
+                txQueue.Clear();
+            }
         }
 
         // BLE Channel Selection Algorithm #1 (all 37 data channels enabled -> mapped == unmapped).
@@ -213,6 +333,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
         // Process a received connection data PDU: LL acknowledgement (SN/NESN) + dispatch payload.
         private void ProcessDataPdu(byte[] frame)
         {
+            peerAnsweredLastEvent = true;
+            connectAttempt = 0;
+            if(connEventCounter > 0)
+            {
+                anchorTxUs = lastTxUs;
+                anchorEvent = connEventCounter - 1;
+            }
             var header0 = frame[4];
             var len = frame[5];
             var llid = header0 & 0x03;
@@ -284,7 +411,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 break;
             case 0x02: // LL_TERMINATE_IND
                 this.Log(LogLevel.Warning, "BleCentralBridge: peer terminated the connection (reason 0x{0:X2})", p.Length > 1 ? p[1] : 0);
-                state = State.Scanning;
+                AbandonConnection();
+                suppressReconnect = true;
                 break;
             default:   // anything we don't implement -> LL_UNKNOWN_RSP
                 EnqueueLlControl(new byte[] { 0x07, opcode });
@@ -350,10 +478,31 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var opcode = att[0];
             switch(opcode)
             {
+            case 0x02: // Peer-initiated ATT_EXCHANGE_MTU_REQ.
+                if(att.Length < 3)
+                {
+                    return;
+                }
+                attMtu = Math.Min((ushort)(att[1] | (att[2] << 8)), LocalAttMtu);
+                SendAtt(new byte[] { 0x03, (byte)(LocalAttMtu & 0xFF), (byte)(LocalAttMtu >> 8) });
+                if(!discoveryStarted)
+                {
+                    discoveryStarted = true;
+                    DiscoverChipobleService();
+                }
+                break;
             case 0x03: // ATT_EXCHANGE_MTU_RSP -> begin CHIPoBLE service discovery
+                if(att.Length < 3)
+                {
+                    return;
+                }
                 attMtu = Math.Min((ushort)(att[1] | (att[2] << 8)), LocalAttMtu);
                 this.Log(LogLevel.Warning, "BleCentralBridge: ATT MTU exchanged -> {0}; discovering CHIPoBLE service", attMtu);
-                DiscoverChipobleService();
+                if(!discoveryStarted)
+                {
+                    discoveryStarted = true;
+                    DiscoverChipobleService();
+                }
                 break;
             case 0x07: // ATT_FIND_BY_TYPE_VALUE_RSP -> CHIPoBLE (0xFFF6) primary service handle range
                 if(att.Length >= 5)
@@ -579,6 +728,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             switch(type)
             {
             case HostFrameConnect:
+                suppressReconnect = false;
                 this.Log(LogLevel.Warning, "BleCentralBridge: host CONNECT (BLE {0})", gattReady ? "ready" : "connecting");
                 break;
             case HostFrameSubscribe:
@@ -599,6 +749,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 EnqueueAtt(new byte[] { 0x12, (byte)(c2CccdHandle & 0xFF), (byte)(c2CccdHandle >> 8), 0x00, 0x00 });
                 break;
             case HostFrameDisconnect:
+                suppressReconnect = true;
                 // RENODE: the host (chip-tool) closed the BLE connection (it does this right after
                 // ThreadNetworkEnable). Previously this was a no-op, so the DEVICE never learned of the
                 // disconnect and kept its BLE link up forever -- and an open BLE connection monopolises the
@@ -614,11 +765,12 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 // them), degrading the Thread link so merge/operational-CASE fail. Stopping the loop frees
                 // the medium for 15.4. ScheduleAction marshals the state change onto the emulation thread
                 // (this runs on the host-socket RX thread), consistent with ConnectionEvent().
+                var disconnectGeneration = connectionGeneration;
                 machine.ScheduleAction(TimeInterval.FromMicroseconds(ConnIntervalMicroseconds * 4), _ =>
                 {
-                    if(state == State.Connected)
+                    if(state == State.Connected && disconnectGeneration == connectionGeneration)
                     {
-                        state = State.Scanning;
+                        AbandonConnection();
                         this.Log(LogLevel.Warning, "BleCentralBridge: connection torn down -> stopped BLE connection events (medium free for 15.4)");
                     }
                 }, "ble-central-terminate");
@@ -763,7 +915,19 @@ namespace Antmicro.Renode.Peripherals.Wireless
         }
 
         private State state = State.Scanning;
-        private bool connectIndScheduled;
+        private uint connectionGeneration;
+        private int connectAttempt;
+        private volatile bool suppressReconnect;
+        private bool peerAnsweredLastEvent;
+        private uint missStreak;
+        private bool searchEngaged;
+        private bool searchEverEngaged;
+        private double currentIntervalUs = ConnIntervalMicroseconds;
+        private double previousEventIntervalUs = ConnIntervalMicroseconds;
+        private double anchorTxUs;
+        private double lastTxUs;
+        private uint anchorEvent;
+        private uint searchSweepBase;
         private byte[] deviceAddress;
         private bool deviceAddressRandom;
 
@@ -786,6 +950,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private ushort c2Handle;         // CHIPoBLE C2 (indications) value handle
         private ushort c2CccdHandle;     // C2 Client Characteristic Configuration Descriptor
         private bool gattReady;
+        private bool discoveryStarted;
         private const ushort LocalAttMtu = 247;
 
         // Our (central/initiator) random address, little-endian.
@@ -801,6 +966,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private const ulong Anchor0DelayMicroseconds = 1650;
         // Connection interval in microseconds (must equal ConnInterval * 1.25ms = 24 * 1.25ms = 30ms).
         private const ulong ConnIntervalMicroseconds = 30000;
+        private const uint SupervisionEvents = 34;
+        private const uint SearchEngageEvents = 4;
 
         // Connection parameters advertised in the CONNECT_IND LLData.
         private const int AdvertisingChannel37 = 240200; // RF center frequency / 10 kHz

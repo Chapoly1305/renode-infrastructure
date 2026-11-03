@@ -195,7 +195,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             var memoryAddress = (long)currentOperation.ExecutionAddress + currentOperation.CommandBytesHandled;
             memoryAddress |= (uint)extendedAddressRegister.Read() << 24;
-            if(memoryAddress > underlyingMemory.Size)
+            if(memoryAddress >= underlyingMemory.Size)
             {
                 this.Log(LogLevel.Error, "Cannot read from address 0x{0:X} because it is bigger than configured memory size.", currentOperation.ExecutionAddress);
                 return 0;
@@ -210,13 +210,15 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 return;
             }
-            underlyingMemory.WriteByte(position, val);
+            // NOR page programming can clear bits only; erase restores ones.
+            underlyingMemory.WriteByte(position, (byte)(underlyingMemory.ReadByte(position) & val));
         }
 
         protected bool TryVerifyWriteToMemory(out long position)
         {
-            position = currentOperation.ExecutionAddress + currentOperation.CommandBytesHandled;
-            if(position > underlyingMemory.Size)
+            position = (long)currentOperation.ExecutionAddress + currentOperation.CommandBytesHandled;
+            position |= (long)extendedAddressRegister.Read() << 24;
+            if(position >= underlyingMemory.Size)
             {
                 this.Log(LogLevel.Error, "Cannot write to address 0x{0:X} because it is bigger than configured memory size.", currentOperation.ExecutionAddress);
                 return false;

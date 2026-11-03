@@ -810,6 +810,12 @@ namespace Antmicro.Renode.Peripherals.Wireless
             hostMailboxRegistersCollection.Reset();
             radioMailboxRegistersCollection.Reset();
 
+            // Compatibility state must reset with the modeled register banks.
+            racStorage0LastRead = 0;
+            racStorage0SpinCount = 0;
+            shadowRegisters.Clear();
+            InitializeUnhandledRegisterResetValues();
+
             UpdateInterrupts();
         }
 

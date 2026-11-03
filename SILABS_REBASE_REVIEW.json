@@ -237,5 +237,22 @@
     "patch_and_baseline_git_blob": "a395643f069c382ab21c1f6808f0a2bf57ac8269",
     "named_thread_recreation_cases_passed": 3
   },
-  "latest_consumer_checkpoint": "renode/tests/peripherals/SiLabs/overlay_migration_validation_20261102.json"
+  "latest_consumer_checkpoint": "renode/tests/peripherals/SiLabs/overlay_migration_validation_20261102.json",
+  "lab_recovery": {
+    "model_code_commit": "32dd8806a8b5186d33175fa0789689b297e9c623",
+    "archive_branch": "archive/lab-runtime-20261103",
+    "archive_commit": "3bc39b9a9deb389905f02e5f6a331ee0c0bcd933",
+    "changes": [
+      "DeviceFamily.EFR32MG21",
+      "Opt-in HFXO2 FSM unlock",
+      "EUSART4 synchronous TX completion"
+    ],
+    "consumer_report": "tests/peripherals/SiLabs/lab_recovery_validation_20261103.json",
+    "HFXO_tests_passed": 4,
+    "MG21_platform_tests_passed": 5,
+    "EUSART4_tests_passed": 4,
+    "EUSART4_upstream_robot_passed": 10,
+    "real_Ltech_PASE": "PASS",
+    "full_commissioning": "NOT_VALIDATED"
+  }
 }

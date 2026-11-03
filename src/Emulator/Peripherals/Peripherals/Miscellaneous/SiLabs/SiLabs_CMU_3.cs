@@ -392,7 +392,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                 new Dictionary<CALCTRL_UPSEL, ulong>();
             getUpselFrequency[CALCTRL_UPSEL.DISABLED] = 0;
             getUpselFrequency[CALCTRL_UPSEL.PRS] = 32768UL;
-            getUpselFrequency[CALCTRL_UPSEL.HFXO] = 39000000UL;
+            getUpselFrequency[CALCTRL_UPSEL.HFXO] = hfxoFrequency;
             getUpselFrequency[CALCTRL_UPSEL.LFXO] = 32768UL;
             getUpselFrequency[CALCTRL_UPSEL.HFRCODPLL] = 1000000UL;
             getUpselFrequency[CALCTRL_UPSEL.HFRCOEM23] = 19000000UL;
@@ -407,7 +407,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             getDownselFrequency[CALCTRL_DOWNSEL.HCLK] = 1000000UL;
             getDownselFrequency[CALCTRL_DOWNSEL.PRS] = 39000000UL;
             getDownselFrequency[CALCTRL_DOWNSEL.HFXO] = (ulong)(
-                39000000UL * (Dpll_N / (float)Dpll_M)
+                hfxoFrequency * (Dpll_N / (float)Dpll_M)
             );
             getDownselFrequency[CALCTRL_DOWNSEL.LFXO] = 32768UL;
             getDownselFrequency[CALCTRL_DOWNSEL.HFRCODPLL] = 19000000UL;

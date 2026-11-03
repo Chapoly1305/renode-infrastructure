@@ -311,10 +311,18 @@ namespace Antmicro.Renode.Peripherals.UART
             else
             {
                 TransmitCharacter(data);
-                txBufferLevelInterrupt.Value = true;
-                txCompleteInterrupt.Value = true;
-                UpdateInterrupts();
             }
+            // TXFL/TXC are driven by the controller's own shift register, so they must be
+            // raised in BOTH modes. Raising them only in the asynchronous branch meant a
+            // polled SPI driver stalled forever after its first byte: the TXEN command
+            // handler pre-arms the flag once, the first byte consumes it, and nothing ever
+            // re-arms it. Observed on LG 4142/8896, whose SE05x secure-element driver
+            // (se05x_efr32mg26_platform.c) spins on TXFLIF before each byte and so parked
+            // the CPU at 0x806471a indefinitely. Real hardware does not gate TXFL on
+            // whether a slave answered.
+            txBufferLevelInterrupt.Value = true;
+            txCompleteInterrupt.Value = true;
+            UpdateInterrupts();
             transferCompleteFlag.Value = true;
         }
 

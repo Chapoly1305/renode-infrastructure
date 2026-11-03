@@ -347,7 +347,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             // Bit 5: Cx_Save: 
             // 0: AES operation is final; the engine will not return the context
             // 1: AES operation is not final; the engine will return the context
-            bool cxSave = ((fetcherDescriptorList[configDescriptorIndex].Data[0] & (0x1 << 4)) > 0);
+            bool cxSave = ((fetcherDescriptorList[configDescriptorIndex].Data[0] & (0x1 << 5)) > 0);
             // Bits 7:6 and 31:28: KeySel
             // bits 7:6->1:0
             // bits 31:28->5:2
@@ -728,12 +728,30 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             }
             case AesMode.Ccm:
             {
-                if(inputHeaderDescriptorIndices.Count == 0)
+                // STAGED CCM: the SDK splits an AEAD operation into several DMA chains and
+                // carries the engine state between them in a 32-byte context blob
+                // (AES_AEAD_CTX_STATE_SZ). Cx_Save asks the engine to emit that blob;
+                // Cx_Load feeds it back. The blob is opaque to firmware, so the model emits a
+                // token and keeps the real inputs in a side table keyed by that token.
+                StagedCcmState staged = null;
+                if(cxLoad)
+                {
+                    staged = RestoreStagedCcm(fetcherDescriptorList, ivDescriptorIndex, iv2DescriptorIndex);
+                    this.Log(LogLevel.Warning, "RunAesEngine(): CCM Cx_Load -- staged state {0}",
+                             staged == null ? "NOT FOUND (falling back to this chain's own descriptors)" : "restored");
+                }
+
+                if(inputHeaderDescriptorIndices.Count == 0 && staged == null)
                 {
                     throw new ArgumentException("RunAesEngine(): CCM header descriptor(s) missing");
                 }
 
-                byte[] headerData = BuildDataArray(inputHeaderDescriptorIndices, fetcherDescriptorList);
+                // On a resumed chain the Header descriptors carry AAD, not another B0 block, so
+                // the CCM parameters must keep coming from the B0 captured on the first stage.
+                byte[] chainHeader = inputHeaderDescriptorIndices.Count == 0
+                    ? null
+                    : BuildDataArray(inputHeaderDescriptorIndices, fetcherDescriptorList);
+                byte[] headerData = staged != null ? staged.Header : chainHeader;
                 this.Log(LogLevel.Noisy, "RunAesEngine(): CCM Header Data ({0} bytes: [{1}])", headerData.Length, BitConverter.ToString(headerData));
                 if(headerData.Length < 16)
                 {
@@ -787,6 +805,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                     this.Log(LogLevel.Noisy, "RunAesEngine(): CCM AAD: [{0}]", BitConverter.ToString(aad));
                 }
 
+                // Final stage of a staged operation: the MAC covers every AAD and payload byte
+                // seen across all the chains, so replace this chain's view with the accumulated
+                // one before the cipher is configured.
+                if(staged != null && !cxSave)
+                {
+                    if(chainHeader != null)
+                    {
+                        staged.Aad.AddRange(DecodeCcmAad(chainHeader));
+                    }
+                    if(staged.Aad.Count > 0)
+                    {
+                        aad = staged.Aad.ToArray();
+                    }
+                    this.Log(LogLevel.Warning,
+                             "RunAesEngine(): CCM final stage id={0}: aadTotal={1}B payloadSoFar={2}B of msgLen={3}",
+                             staged.Id, staged.Aad.Count, staged.Payload.Count, staged.MessageLength);
+                    stagedCcmStates.Remove(staged.Id);
+                }
+
                 CcmBlockCipher cipher = new CcmBlockCipher(new AesEngine());
                 AeadParameters parameters = new AeadParameters(keyParameter,
                                                                tagLength * 8, // tag length in bits (inferred from flags byte)
@@ -796,9 +833,69 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
 
                 byte[] finalOutput = null;
 
-                if(encrypt)
+                if(cxSave)
+                {
+                    // A non-final stage. Accumulate what this chain carries, return the CTR
+                    // transform of its own payload slice, and hand back the context token.
+                    // The stock model had no staged path at all: it fell into the one-shot
+                    // decrypt branch and dereferenced the null BuildDataArray() result for a
+                    // payload-less chain, aborting the emulator.
+                    if(staged == null)
+                    {
+                        stagedCcmCounter++;
+                        staged = new StagedCcmState
+                        {
+                            Id = stagedCcmCounter,
+                            Encrypt = encrypt,
+                            Key = key,
+                            Header = headerData,
+                            Nonce = nonce,
+                            TagLength = tagLength,
+                            MessageLength = messageLength,
+                        };
+                    }
+                    else if(chainHeader != null)
+                    {
+                        staged.Aad.AddRange(DecodeCcmAad(chainHeader));
+                    }
+
+                    var slice = BuildDataArray(inputPayloadDescriptorIndices, fetcherDescriptorList);
+                    byte[] sliceOutput = new byte[0];
+                    if(slice != null && slice.Length > 0)
+                    {
+                        sliceOutput = CcmCtrTransform(staged.Key, staged.Nonce, slice, staged.Payload.Count);
+                        staged.Payload.AddRange(slice);
+                    }
+
+                    var token = StagedCcmToken(staged);
+                    finalOutput = new byte[sliceOutput.Length + token.Length];
+                    Array.Copy(sliceOutput, 0, finalOutput, 0, sliceOutput.Length);
+                    Array.Copy(token, 0, finalOutput, sliceOutput.Length, token.Length);
+
+                    this.Log(LogLevel.Warning,
+                             "RunAesEngine(): CCM staged op id={0}: cxLoad={1} slice={2}B aadTotal={3}B "
+                             + "payloadTotal={4}B of msgLen={5} -- returning {6}B (slice + {7}B context)",
+                             staged.Id, cxLoad, sliceOutput.Length, staged.Aad.Count, staged.Payload.Count,
+                             staged.MessageLength, finalOutput.Length, token.Length);
+                }
+                else if(encrypt)
                 {
                     byte[] plaintextData = BuildDataArray(inputPayloadDescriptorIndices, fetcherDescriptorList);
+                    // Staged operation, same as the decrypt branch below: the earlier chains'
+                    // plaintext is not repeated here but the CBC-MAC covers all of it, so put it
+                    // back in front and cut the already-delivered ciphertext off the output.
+                    int alreadyEmitted = 0;
+                    if(staged != null && staged.Payload.Count > 0)
+                    {
+                        alreadyEmitted = staged.Payload.Count;
+                        var combined = new byte[alreadyEmitted + (plaintextData == null ? 0 : plaintextData.Length)];
+                        staged.Payload.CopyTo(combined, 0);
+                        if(plaintextData != null)
+                        {
+                            Array.Copy(plaintextData, 0, combined, alreadyEmitted, plaintextData.Length);
+                        }
+                        plaintextData = combined;
+                    }
                     var plaintextDataLength = (plaintextData == null) ? 0 : plaintextData.Length; 
 
                     this.Log(LogLevel.Noisy, "RunAesEngine(): CCM Plaintext Data ({0} bytes): [{1}]", plaintextDataLength, (plaintextData == null) ? "" : BitConverter.ToString(plaintextData));
@@ -818,10 +915,34 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
                     this.Log(LogLevel.Noisy, "RunAesEngine(): CCM Encrypted Data: [{0}]", BitConverter.ToString(finalOutput, 0, plaintextDataLength));
                     this.Log(LogLevel.Noisy, "RunAesEngine(): CCM Authentication Tag: [{0}]", BitConverter.ToString(finalOutput, plaintextDataLength, tagLength));
                     this.Log(LogLevel.Noisy, "RunAesEngine(): CCM final output: [{0}]", BitConverter.ToString(finalOutput));
+
+                    if(alreadyEmitted > 0)
+                    {
+                        var tail = new byte[finalOutput.Length - alreadyEmitted];
+                        Array.Copy(finalOutput, alreadyEmitted, tail, 0, tail.Length);
+                        this.Log(LogLevel.Warning,
+                                 "RunAesEngine(): CCM staged final (encrypt): returning {0}B "
+                                 + "({1}B ciphertext tail + {2}B tag; {3}B already emitted)",
+                                 tail.Length, tail.Length - tagLength, tagLength, alreadyEmitted);
+                        finalOutput = tail;
+                    }
                 }
                 else
                 {
-                    byte[] inputData = BuildDataArray(inputPayloadDescriptorIndices, fetcherDescriptorList);
+                    byte[] inputData = BuildDataArray(inputPayloadDescriptorIndices, fetcherDescriptorList) ?? new byte[0];
+                    // Staged operation: the earlier chains' ciphertext is not repeated in this
+                    // chain, but the CBC-MAC covers all of it, so put it back in front. Their
+                    // plaintext has already been handed to the firmware, so it is cut off the
+                    // output again below.
+                    int alreadyDelivered = 0;
+                    if(staged != null && staged.Payload.Count > 0)
+                    {
+                        alreadyDelivered = staged.Payload.Count;
+                        var combined = new byte[alreadyDelivered + inputData.Length];
+                        staged.Payload.CopyTo(combined, 0);
+                        Array.Copy(inputData, 0, combined, alreadyDelivered, inputData.Length);
+                        inputData = combined;
+                    }
                     this.Log(LogLevel.Noisy, "RunAesEngine(): CCM Input Data (cipher text + Tag) ({0} bytes): [{1}]", inputData.Length, BitConverter.ToString(inputData));
 
                     finalOutput = new byte[inputData.Length];
@@ -853,6 +974,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
 
                     // Copy the tag before DoFinal() which is XOR'd with the key (hence, all zeros when the tag matches)
                     Array.Copy(tag, 0, finalOutput, ciphertextLength, tagLength);
+
+                    if(alreadyDelivered > 0)
+                    {
+                        var tail = new byte[finalOutput.Length - alreadyDelivered];
+                        Array.Copy(finalOutput, alreadyDelivered, tail, 0, tail.Length);
+                        this.Log(LogLevel.Warning,
+                                 "RunAesEngine(): CCM staged final: TagMatch={0}, returning {1}B "
+                                 + "({2}B plaintext tail + {3}B tag; {4}B already delivered)",
+                                 tagMatch, tail.Length, tail.Length - tagLength, tagLength, alreadyDelivered);
+                        finalOutput = tail;
+                        ciphertextLength -= alreadyDelivered;
+                    }
 
                     this.Log(LogLevel.Noisy, "RunAesEngine(): CCM Decrypt TagMatch={0} Tag={{1}}", tagMatch, BitConverter.ToString(tag));
                     this.Log(LogLevel.Noisy, "RunAesEngine(): CCM Decrypted Data: [{0}]", BitConverter.ToString(finalOutput, 0, ciphertextLength));
@@ -1479,6 +1612,132 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous.SiLabs
             }
             return ret;
         }
+
+        // ---------------------------------------------------------------------------------
+        // Staged AES-CCM support.
+        //
+        // The SDK (security_sxsymcrypt/src/aead.c) performs an AEAD operation in stages when
+        // it cannot present all the data at once: AES_AEAD_MODEID_CTX_SAVE (bit 5) asks the
+        // engine to write out a 32-byte state (AES_AEAD_CTX_STATE_SZ) and
+        // AES_AEAD_MODEID_CTX_LOAD (bit 4) feeds it back on the next chain. The state is
+        // opaque to firmware -- it only ever stores it and hands it back -- so the model
+        // writes a recognisable token and keeps the real CCM inputs here, keyed by the token.
+        //
+        // This models the case the firmware actually uses (a save stage that carries the
+        // header/AAD, then a load stage carrying the payload). Splitting the PAYLOAD across
+        // several staged chains is NOT modelled: that would need real CCM state, and the
+        // model logs a warning and falls back rather than silently returning a wrong result.
+        // ---------------------------------------------------------------------------------
+        private class StagedCcmState
+        {
+            public uint Id;
+            public bool Encrypt;
+            public byte[] Key;
+            public byte[] Header;
+            public byte[] Nonce;
+            public int TagLength;
+            public uint MessageLength;
+            // Accumulated across stages: the CBC-MAC half of CCM needs every AAD and payload
+            // byte, and it is only evaluated on the final stage.
+            public List<byte> Aad = new List<byte>();
+            public List<byte> Payload = new List<byte>();
+        }
+
+        private byte[] StagedCcmToken(StagedCcmState state)
+        {
+            var token = new byte[StagedCcmStateSize];
+            // "RNDCCM" + a counter, so a restored blob is unambiguous and easy to spot in a
+            // memory dump. The remaining bytes stay zero.
+            var magic = new byte[] { (byte)'R', (byte)'N', (byte)'D', (byte)'C', (byte)'C', (byte)'M' };
+            Array.Copy(magic, token, magic.Length);
+            token[magic.Length + 0] = (byte)(state.Id >> 24);
+            token[magic.Length + 1] = (byte)(state.Id >> 16);
+            token[magic.Length + 2] = (byte)(state.Id >> 8);
+            token[magic.Length + 3] = (byte)(state.Id);
+            stagedCcmStates[state.Id] = state;
+            return token;
+        }
+
+        // CCM's payload layer is CTR with counter blocks A_i = flags || nonce || i, i starting
+        // at 1 (A_0 masks the tag). That makes a payload slice transformable at its byte
+        // offset, which is what lets a staged chain return its own plaintext without the
+        // rest of the message being available yet.
+        // A resumed chain's Header descriptor carries the AAD in CCM's own on-the-wire
+        // encoding: a 2-byte big-endian length followed by that many AAD bytes, zero-padded
+        // out to the descriptor. BouncyCastle's AeadParameters takes RAW AAD and applies the
+        // length encoding itself, so the prefix has to come off or the AAD is encoded twice
+        // and the tag never verifies. Measured on IKEA 4476/36873: the 10 valid bytes are
+        // 00-08 followed by the 8-byte Matter message header.
+        private static byte[] DecodeCcmAad(byte[] block)
+        {
+            if(block == null || block.Length < 2)
+            {
+                return block ?? new byte[0];
+            }
+            int declaredLength = (block[0] << 8) | block[1];
+            if(declaredLength > 0 && declaredLength <= block.Length - 2)
+            {
+                var aad = new byte[declaredLength];
+                Array.Copy(block, 2, aad, 0, declaredLength);
+                return aad;
+            }
+            return block;
+        }
+
+        private byte[] CcmCtrTransform(byte[] key, byte[] nonce, byte[] input, int offset)
+        {
+            var engine = new AesEngine();
+            engine.Init(true, new KeyParameter(key));
+            int l = 15 - nonce.Length;
+            var output = new byte[input.Length];
+            var counterBlock = new byte[16];
+            var keyStream = new byte[16];
+            for(int i = 0; i < input.Length; i++)
+            {
+                int absolute = offset + i;
+                if(i == 0 || (absolute % 16) == 0)
+                {
+                    int counter = absolute / 16 + 1;
+                    Array.Clear(counterBlock, 0, counterBlock.Length);
+                    counterBlock[0] = (byte)(l - 1);
+                    Array.Copy(nonce, 0, counterBlock, 1, nonce.Length);
+                    for(int b = 0; b < l; b++)
+                    {
+                        counterBlock[15 - b] = (byte)(counter >> (8 * b));
+                    }
+                    engine.ProcessBlock(counterBlock, 0, keyStream, 0);
+                }
+                output[i] = (byte)(input[i] ^ keyStream[absolute % 16]);
+            }
+            return output;
+        }
+
+        private StagedCcmState RestoreStagedCcm(List<DmaDescriptor> fetcherDescriptorList,
+                                                int ivDescriptorIndex, int iv2DescriptorIndex)
+        {
+            // The context comes back through the IV parameter region; the 32-byte blob may
+            // arrive as one descriptor or as IV (16) + IV2 (16).
+            var blob = new List<byte>();
+            foreach(var index in new[] { ivDescriptorIndex, iv2DescriptorIndex })
+            {
+                if(index >= 0 && fetcherDescriptorList[index].Data != null)
+                {
+                    blob.AddRange(fetcherDescriptorList[index].Data);
+                }
+            }
+            if(blob.Count < 10 || blob[0] != (byte)'R' || blob[1] != (byte)'N' || blob[2] != (byte)'D'
+               || blob[3] != (byte)'C' || blob[4] != (byte)'C' || blob[5] != (byte)'M')
+            {
+                return null;
+            }
+            uint id = (uint)((blob[6] << 24) | (blob[7] << 16) | (blob[8] << 8) | blob[9]);
+            StagedCcmState state;
+            return stagedCcmStates.TryGetValue(id, out state) ? state : null;
+        }
+
+        private const int StagedCcmStateSize = 32;
+        private uint stagedCcmCounter = 0;
+        private readonly Dictionary<uint, StagedCcmState> stagedCcmStates = new Dictionary<uint, StagedCcmState>();
 
         // Number of real message bytes in a data descriptor. The fetcher transfers whole
         // words, and InvalidBytesOrBits counts the trailing bytes of that transfer which are

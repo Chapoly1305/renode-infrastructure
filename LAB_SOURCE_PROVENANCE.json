@@ -1,0 +1,22 @@
+{
+  "purpose": "Exact source-provenance snapshot, not the 26q3 deployment branch",
+  "source_host": "chen@lab",
+  "source_path": "/home/chen/renode-matter-groundtruth/src/Infrastructure",
+  "source_commit": "43a2158d336a29793b022713945ff37cc9b6f593",
+  "working_diff_sha256": "a8ec6adf62fe99f67ef9a25b1f3ce173dd3ba2071c4470f4abcae6dd7e9725f5",
+  "lab_binary_sha256": "01fe9d02a378d894e78d2d14cc2ef968841ff1c33cef9aff1016654c0d91f2a8",
+  "files": {
+    "src/Emulator/Peripherals/Peripherals/Miscellaneous/SiLabs/SiLabs_SYMCRYPTO_1.cs": {
+      "git_blob": "2889ec9d544174e19da106f2af26783901bde693",
+      "sha256": "a86ec91a6bc6cbca731c6beae60c7af199f50cd55fc6691f69c1b50f12308060"
+    },
+    "src/Emulator/Peripherals/Peripherals/UART/SiLabs_EUSART_2.cs": {
+      "git_blob": "dafc3195951e70c1dbfcdb928de123ac81d2c7e2",
+      "sha256": "eac649ff12e2cd2c91f919ca840ab38d14ffea0873a1177fe23dec6491bd7365"
+    },
+    "src/Emulator/Peripherals/Peripherals/UART/SiLabs_EUSART_4.cs": {
+      "git_blob": "358f8799fe896643c7ed96f84a5024b395a03d6a",
+      "sha256": "19c785df3470043a72f9b52e473a09b7007fbfcf6e8342979845f45f0f8d53ee"
+    }
+  }
+}

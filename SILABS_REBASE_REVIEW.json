@@ -6,7 +6,7 @@
     "component_checks_passed": 79,
     "board_load_reset": "PASS",
     "custom_SEMAILBOX1_TXINT_tests": 5,
-    "compiled_bridge_UDP_BLE_and_RF_routing_tests": 13,
+    "compiled_bridge_UDP_BLE_and_RF_routing_tests": 16,
     "guarded_hostmailbox_compensation_tests": 10,
     "consumer_report": "renode/tests/peripherals/SiLabs/mailbox_fix_validation_20261102.json",
     "firmware_gate": "PASS for Ltech 5535/45058 (8.68s) and Quectel 5136/554 (9.87s) to GATT with explicit compensation",
@@ -22,7 +22,6 @@
     "SYSRTC1_regression_tests": 2,
     "board_and_bridge_load_reset": "PASS",
     "pending": [
-      "bridge reset with active traffic",
       "firmware commissioning, Thread attach and operational Invoke/Read",
       "shadow-register and Storage0 compensation relevance",
       "physical mailbox/scheduler fidelity fix to replace opt-in acknowledgement compensation"
@@ -155,5 +154,50 @@
     "consumer_report": "renode/tests/peripherals/SiLabs/symcrypto_hash_validation_20261102.json"
   },
   "all_historical_local_changes_migrated": false,
-  "remaining_inventory": "renode/SILABS_MIGRATION_INVENTORY.json (51 overlay-related files, 17 unique C# workspace variants inventoried; not a completed semantic review)"
+  "remaining_inventory": "renode/SILABS_MIGRATION_INVENTORY.json (51 overlay-related files still pending migration; 17 unique C# workspace variants reviewed and physical deltas ported, controls excluded)",
+  "additional_local_models": [
+    {
+      "commit": "3fd5c2d5",
+      "model": "SiLabs_GPIO_3",
+      "changes": "Unmapped EXTI sentinel, per-pin edge history and correct trigger clearing",
+      "component_cases_passed": 7
+    },
+    {
+      "commit": "1d04d7da",
+      "model": "BleCentralBridge",
+      "changes": "Recovered deployed supervision/rescan, interval search, MTU handling and callback generations",
+      "compiled_bridge_cases_passed": 16,
+      "synthetic_source_scheduler_assertions": 23,
+      "limit": "Interval search is central scheduling compensation; vendor skew scenarios not replayed"
+    },
+    {
+      "commit": "8fb6625b",
+      "model": "GenericSpiFlash",
+      "changes": "NOR programming clears bits only; EAR applies to writes; end bounds rejected",
+      "component_cases_passed": 6,
+      "limit": "Aqara full firmware scenario pending"
+    },
+    {
+      "commit": "8fb6625b",
+      "model": "SiLabs_EUSART_2",
+      "changes": "CMD RXBLOCKEN/DIS, read-only STATUS and gate before overflow detection",
+      "component_cases_passed": 6,
+      "upstream_EUSART_robot_cases_passed": 10,
+      "physical_FIFO_capacity_unchanged": true
+    }
+  ],
+  "local_CSharp_workspace_review": {
+    "unique_name_hash_pairs": 17,
+    "review_complete": true,
+    "ported_groups": [
+      "GPIO3 EXTI",
+      "EUSART2 RXBLOCK",
+      "R4 NOR physical semantics"
+    ],
+    "excluded_groups": [
+      "8 FIFO/overflow diagnostic variants",
+      "5 GPIO sham/partial-fix control variants"
+    ],
+    "limit": "Does not include board overlays or every deployed DLL model"
+  }
 }

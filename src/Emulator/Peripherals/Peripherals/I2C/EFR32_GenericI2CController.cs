@@ -122,6 +122,15 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         protected DoubleWordRegister GenerateInterruptFlagSetRegister() => interruptsManager.GetInterruptSetRegister<DoubleWordRegister>();
 
+        protected DoubleWordRegister GenerateSeries2InterruptFlagAliasRegister(bool set) => interruptsManager.GetRegister<DoubleWordRegister>(
+            writeCallback: (irq, _, value) =>
+            {
+                if(value && irq != Interrupt.TransmitBufferLevel && irq != Interrupt.ReceiveDataValid)
+                {
+                    interruptsManager.SetInterrupt(irq, set);
+                }
+            });
+
         protected DoubleWordRegister GenerateInterruptEnableRegister() => interruptsManager.GetInterruptEnableRegister<DoubleWordRegister>();
 
         protected DoubleWordRegister GenerateInterruptFlagRegister(bool maskByEnable = true) => interruptsManager.GetRegister<DoubleWordRegister>(

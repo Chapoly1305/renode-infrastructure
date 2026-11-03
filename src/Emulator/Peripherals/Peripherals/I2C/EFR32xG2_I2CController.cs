@@ -40,8 +40,8 @@ namespace Antmicro.Renode.Peripherals.I2C
                 {(long)Registers.TransmitBufferDoubleData, GenerateTransmitBufferDoubleDataRegister()},
                 {(long)Registers.InterruptFlag, GenerateInterruptFlagRegister(maskByEnable: false)},
                 {(long)Registers.InterruptEnable, GenerateInterruptEnableRegister()},
-                {(long)Registers.InterruptFlagSet, GenerateInterruptFlagSetRegister()},
-                {(long)Registers.InterruptFlagClear, GenerateInterruptFlagClearRegister()},
+                {(long)Registers.InterruptFlagSet, GenerateSeries2InterruptFlagAliasRegister(set: true)},
+                {(long)Registers.InterruptFlagClear, GenerateSeries2InterruptFlagAliasRegister(set: false)},
             };
             registers = new DoubleWordRegisterCollection(this, map);
         }
@@ -52,6 +52,11 @@ namespace Antmicro.Renode.Peripherals.I2C
         }
 
         public void WriteDoubleWord(long offset, uint value)
+        {
+            machine.ClockSource.ExecuteInLock(() => WriteRegister(offset, value));
+        }
+
+        private void WriteRegister(long offset, uint value)
         {
             var address = offset & 0xFFF;
             var operation = offset & 0x3000;

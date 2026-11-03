@@ -6,6 +6,8 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
@@ -19,7 +21,13 @@ namespace Antmicro.Renode.Peripherals.Timers
     {
         public SiLabs_TIMER_1(Machine machine, int width) : this(machine)
         {
-            this.timerLimit = (uint)(1 << width) - 1;   // setting timerLimit to max possible value of the given bit width
+            if(width < 1 || width > 32)
+            {
+                throw new ArgumentOutOfRangeException(nameof(width), width, "Timer width must be between 1 and 32 bits.");
+            }
+
+            // LimitTimer's period is exclusive; the counter wraps after 2^width ticks.
+            timerLimit = 1UL << width;
         }
 
         partial void SiLabs_TIMER_1_Constructor()
@@ -169,14 +177,14 @@ namespace Antmicro.Renode.Peripherals.Timers
             uint currentValue = restartFromZero ? 0 : TimerCounter;
 
             timer.Enabled = false;
-            uint limit = timerLimit;
+            ulong limit = timerLimit;
 
             // Check whether the limit should be set to a compare value
             if(ien_cc0_bit.Value
                 && currentValue < (cc_oc_oc_field[0].Value + 1)
                 && (cc_oc_oc_field[0].Value + 1) < limit)
             {
-                limit = (uint)cc_oc_oc_field[0].Value + 1;
+                limit = cc_oc_oc_field[0].Value + 1;
             }
 
             // Add remaining compare channels as needed
@@ -200,6 +208,6 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private LimitTimer timer;
         private bool timerIsRunning = false;
-        private readonly uint timerLimit;
+        private readonly ulong timerLimit;
     }
 }

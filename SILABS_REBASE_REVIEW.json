@@ -114,14 +114,21 @@
   ],
   "not_included": [
     "Sibling hash patch not cherry-picked: inherited 26q3 implementation now passes six equivalent descriptor regressions; see hash_follow_up",
-    "Other local mw-emu overlays and diagnostics; hostmailbox compensation is now separately ported above",
-    "pseudo_rng development branch",
-    "MG21 feature branches"
+    "MG21 platform/DeviceFamily/HFXO changes pending; its Thumb-2 tlib fix is now separately ported above.",
+    "Private provision-page bytes remain in the original corpus; compatibility/diagnostic overlays are explicit consumer profiles."
   ],
   "tlib": {
-    "commit": "43a51de2aa1b05fdfd2073681b9b027af555422c",
-    "source": "SiliconLabsSoftware/renode-tlib",
-    "reason": "Match upstream 26q3 gitlink; do not substitute old MG21 tlib"
+    "baseline": "43a51de2aa1b05fdfd2073681b9b027af555422c",
+    "commit": "c04d273709cfe8e604233199dc54f638210c9eb5",
+    "source": "Chapoly1305/tlib",
+    "old_patch": "23cafae344f4f663879e38903c78b20a3e1602d6",
+    "reason": "Rebase only the historical MOV.W SP fix onto 26q3, then constrain it using Arm DDI0553B.y C2.4.120 rather than allowing all SP operands. Preserve upstream MVE wide-shift decoding.",
+    "compiled_regressions": {
+      "MOV_SP_boundary_cases": 5,
+      "upstream_Thumb2_data_processing_suites": 1,
+      "upstream_MVE_long_shift_cases": 2
+    },
+    "consumer_report": "renode/tests/peripherals/SiLabs/overlay_migration_validation_20261102.json"
   },
   "additional_local_port": {
     "source": "mw-emu/scripts/renode_patches/silabs_xg24_lpw_hostmailbox_deadlock.patch",
@@ -154,7 +161,7 @@
     "consumer_report": "renode/tests/peripherals/SiLabs/symcrypto_hash_validation_20261102.json"
   },
   "all_historical_local_changes_migrated": false,
-  "remaining_inventory": "renode/SILABS_MIGRATION_INVENTORY.json (51 overlay-related files still pending migration; 17 unique C# workspace variants reviewed and physical deltas ported, controls excluded)",
+  "remaining_inventory": "renode/SILABS_MIGRATION_INVENTORY.json: 51 overlay-related files and 17 C# workspace variants have explicit source dispositions; full deployed-runtime equivalence, vendor commissioning/host tooling and remaining platform work are incomplete.",
   "additional_local_models": [
     {
       "commit": "3fd5c2d5",
@@ -184,6 +191,31 @@
       "component_cases_passed": 6,
       "upstream_EUSART_robot_cases_passed": 10,
       "physical_FIFO_capacity_unchanged": true
+    },
+    {
+      "commit": "3521b709",
+      "model": "SiLabs_CMU_3 and SiLabs_CMU_7",
+      "changes": "Use configured HFXO for calibration numerator/denominator",
+      "configurations_passed": 14,
+      "baseline_subcase_failures": 8
+    },
+    {
+      "commits": [
+        "1ce5097c",
+        "c1c6e4eb"
+      ],
+      "model": "EFR32xG2_I2CController",
+      "changes": "Serialized SET/CLR/TGL, selective IF alias writes and raw polling flags. Consumer xG24/xG26 platforms select the proper Series-2 model.",
+      "cases_passed": 8,
+      "absent_peer_contract": "NACK remains visible with IEN disabled; synthetic success is not used"
+    },
+    {
+      "commit": "1e2159aa",
+      "model": "SiLabs_EUSART_2",
+      "changes": "Recovered deployed synchronous completion; persistent synchronous TX-ready level and read-only FIFO-ready status",
+      "cases_passed": 5,
+      "upstream_EUSART_cases_passed": 10,
+      "source_limit": "Original runtime-loaded LG subclass source not recovered; documented behavior reimplemented and component-tested."
     }
   ],
   "local_CSharp_workspace_review": {
@@ -199,5 +231,11 @@
       "5 GPIO sham/partial-fix control variants"
     ],
     "limit": "Does not include board overlays or every deployed DLL model"
-  }
+  },
+  "pseudo_rng": {
+    "status": "ALREADY_UPSTREAM",
+    "patch_and_baseline_git_blob": "a395643f069c382ab21c1f6808f0a2bf57ac8269",
+    "named_thread_recreation_cases_passed": 3
+  },
+  "latest_consumer_checkpoint": "renode/tests/peripherals/SiLabs/overlay_migration_validation_20261102.json"
 }

@@ -1,7 +1,7 @@
 {
   "baseline": "3bfa03fafad9fb70dd705b65f2e435c0bbde4de1",
   "branch": "integration/stock-ble-on-silabs-26q3",
-  "promotion_status": "FULL_STOCK_E2E_PASSED_RF_RESET_REPLAY_PENDING",
+  "promotion_status": "SOURCE_REBASE_QUALIFIED_WITH_DOCUMENTED_LEGACY_LIMITS",
   "expanded_regression": {
     "component_checks_passed": 79,
     "board_load_reset": "PASS",
@@ -21,9 +21,7 @@
     "xg24_PROTIMER_tests": 5,
     "SYSRTC1_regression_tests": 2,
     "board_and_bridge_load_reset": "PASS",
-    "pending": [
-      "Final packet replay after RF shadow/Storage0 reset correction"
-    ],
+    "pending": [],
     "stock_full_commissioning": {
       "Ltech": "PASS: native UDP CASE, CommissioningComplete and Read/Toggle/Read with state change",
       "LG": "PASS with explicit MG24A profile",
@@ -166,8 +164,7 @@
     "original_sdk_probe_replayed": false,
     "consumer_report": "renode/tests/peripherals/SiLabs/symcrypto_hash_validation_20261102.json"
   },
-  "all_historical_local_changes_migrated": false,
-  "remaining_inventory": "Retained source changes and explicit exclusions are inventoried. Legacy physical timing/vendor limits and exact old DLL provenance remain documented; final RF-reset packet replay and consumer artifact backup are pending.",
+  "remaining_inventory": "All inventoried retained changes migrated or covered by upstream equivalents; experimental exclusions and legacy firmware/timing limits are explicit. Exact old DLL build provenance is unavailable.",
   "additional_local_models": [
     {
       "commit": "3fd5c2d5",
@@ -268,6 +265,16 @@
     "baseline_failures": 3,
     "corrected_methods_passed": 6,
     "hostmailbox_control_methods_passed": 10,
-    "scope": "RF shadow fallback reset defaults, discard unknown writes, modeled read-only priority, shared aliases and Storage0 streak reset. No silicon fidelity claim."
-  }
+    "scope": "RF shadow fallback reset defaults, discard unknown writes, modeled read-only priority, shared aliases and Storage0 streak reset. No silicon fidelity claim.",
+    "final_packet_replay": {
+      "Ltech": "FULL_PASS 35.38s",
+      "LG_MG24A": "FULL_PASS 40.23s",
+      "Quectel": "Existing ThreadNetworkEnable timeout persists; reproduced on old runtime",
+      "image": "sha256:ecdd345ac7d71485ef226f89fd850512c8dcbf24e06155cb742635ec3f04ab74",
+      "cold_build_root_commit": "deb4cd2fa85b057538597a27fbf7e0580e94c303",
+      "cold_reset_component_tests_passed": 6
+    }
+  },
+  "inventoried_source_review_complete": true,
+  "retained_improvements_migrated": true
 }

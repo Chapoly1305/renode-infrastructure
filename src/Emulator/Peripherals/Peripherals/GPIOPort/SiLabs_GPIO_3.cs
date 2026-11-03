@@ -113,7 +113,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             for(uint i = 0; i < NumberOfPins * NumberOfPorts; i++)
             {
-                targetExternalPins[i] = 0;
+                targetExternalPins[i] = NoExternalInterrupt;
             }
 
             for(uint i = 0; i < NumberOfExternalInterrupts; i++)
@@ -138,13 +138,13 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 {
                     var externalInterruptIndex = targetExternalPins[i];
 
-                    if(!externalInterruptEnable[externalInterruptIndex].Value)
+                    if(externalInterruptIndex == NoExternalInterrupt || !externalInterruptEnable[externalInterruptIndex].Value)
                     {
                         continue;
                     }
 
-                    var isEdge = (State[i] != previousState[externalInterruptIndex]);
-                    previousState[externalInterruptIndex] = State[i];
+                    var isEdge = (State[i] != previousState[i]);
+                    previousState[i] = State[i];
 
                     if(isEdge
                        && ((State[i] && ((interruptTrigger[externalInterruptIndex] & (uint)InterruptTrigger.RisingEdge) > 0))
@@ -369,7 +369,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                                    }
                                    else
                                    {
-                                       interruptTrigger[i] ^= (uint)InterruptTrigger.RisingEdge;
+                                       interruptTrigger[i] &= ~(uint)InterruptTrigger.RisingEdge;
                                    }
                                },
                                valueProviderCallback: (i, _) => ((interruptTrigger[i] & (uint)InterruptTrigger.RisingEdge) > 0),
@@ -386,7 +386,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                                    }
                                    else
                                    {
-                                       interruptTrigger[i] ^= (uint)InterruptTrigger.FallingEdge;
+                                       interruptTrigger[i] &= ~(uint)InterruptTrigger.FallingEdge;
                                    }
                                },
                                valueProviderCallback: (i, _) => ((interruptTrigger[i] & (uint)InterruptTrigger.FallingEdge) > 0),
@@ -613,11 +613,11 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             for(var i = 0; i < NumberOfExternalInterrupts; i++)
             {
                 interruptTrigger[i] = (uint)InterruptTrigger.None;
-                previousState[i] = false;
             }
             for(var i = 0; i < NumberOfPins * NumberOfPorts; i++)
             {
-                targetExternalPins[i] = 0;
+                targetExternalPins[i] = NoExternalInterrupt;
+                previousState[i] = false;
             }
         }
 
@@ -720,7 +720,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private IEnumRegisterField<Port> EUSART1_TxRoutePort;
         private IValueRegisterField EUSART1_TxRoutePin;
         private bool configurationLocked;
-        private readonly bool[] previousState = new bool[NumberOfExternalInterrupts];
+        private readonly bool[] previousState = new bool[NumberOfPins * NumberOfPorts];
         private readonly uint[] interruptTrigger = new uint[NumberOfExternalInterrupts];
         private readonly uint[] targetExternalPins = new uint[NumberOfPins * NumberOfPorts];
         private readonly IFlagRegisterField[] externalInterruptEnable = new IFlagRegisterField[NumberOfExternalInterrupts];
@@ -736,6 +736,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private const int NumberOfPorts = 4;
         private const int NumberOfPins = 16;
         private const int NumberOfExternalInterrupts = 16;
+        private const uint NoExternalInterrupt = uint.MaxValue;
         private const int UnlockCode = 0xA534;
         private const int PortOffset = 0x30;
 

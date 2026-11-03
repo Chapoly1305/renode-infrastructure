@@ -263,6 +263,13 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             machine.ClockSource.ExecuteInLock(delegate
             {
+                // Synchronous transfers complete immediately in this model,
+                // leaving the TX FIFO below its watermark. TXFL is a level,
+                // so clearing IF cannot remove it while TX remains enabled.
+                if(operationModeField.Value == OperationMode.Synchronous)
+                {
+                    txBufferLevelInterrupt.Value = transmitterEnableFlag.Value;
+                }
                 var txIrq = ((txCompleteInterruptEnable.Value && txCompleteInterrupt.Value)
                              || (txBufferLevelInterruptEnable.Value && txBufferLevelInterrupt.Value));
                 TransmitIRQ.Set(txIrq);
@@ -311,10 +318,10 @@ namespace Antmicro.Renode.Peripherals.UART
             else
             {
                 TransmitCharacter(data);
-                txBufferLevelInterrupt.Value = true;
-                txCompleteInterrupt.Value = true;
-                UpdateInterrupts();
             }
+            txBufferLevelInterrupt.Value = true;
+            txCompleteInterrupt.Value = true;
+            UpdateInterrupts();
             transferCompleteFlag.Value = true;
         }
 
@@ -598,7 +605,7 @@ namespace Antmicro.Renode.Peripherals.UART
                             UpdateInterrupts();
                         }
                     }, name: "TXEN")
-                    .WithFlag(3, FieldMode.Set, writeCallback: (_, newValue) => { if(newValue) transmitterEnableFlag.Value = false; }, name: "TXDIS")
+                    .WithFlag(3, FieldMode.Set, writeCallback: (_, newValue) => { if(newValue) { transmitterEnableFlag.Value = false; UpdateInterrupts(); } }, name: "TXDIS")
                     .WithFlag(4, FieldMode.Set, writeCallback: (_, value) => { if(value) receiveBlocked = true; }, name: "RXBLOCKEN")
                     .WithFlag(5, FieldMode.Set, writeCallback: (_, value) => { if(value) receiveBlocked = false; }, name: "RXBLOCKDIS")
                     .WithFlag(6, name: "TXTRIEN")
@@ -625,7 +632,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     .WithFlag(3, FieldMode.Read, valueProviderCallback: _ => receiveBlocked, name: "RXBLOCK")
                     .WithFlag(4, name: "TXTRI")
                     .WithFlag(5, out transferCompleteFlag, FieldMode.Read, name: "TXC")
-                    .WithFlag(6, name: "TXFL")
+                    .WithFlag(6, FieldMode.Read, valueProviderCallback: _ => true, name: "TXFL")
                     .WithFlag(7, out receiveDataValidFlag, FieldMode.Read, name: "RXFL")
                     .WithFlag(8, FieldMode.Read, valueProviderCallback: _ => Count == BufferSize, name: "RXFULL")
                     .WithReservedBits(9,3)

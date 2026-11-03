@@ -114,7 +114,7 @@
     }
   ],
   "not_included": [
-    "Sibling hash-patch branch: upstream engine was rewritten; test before importing any remaining semantics",
+    "Sibling hash patch not cherry-picked: inherited 26q3 implementation now passes six equivalent descriptor regressions; see hash_follow_up",
     "Other local mw-emu overlays and diagnostics; hostmailbox compensation is now separately ported above",
     "pseudo_rng development branch",
     "MG21 feature branches"
@@ -142,5 +142,18 @@
   "additional_upstream_API_adaptation": {
     "commit": "a963fee5",
     "change": "Use frequency/10kHz medium routing keys in both bridges; retain protocol Thread channel in OT-sim UDP datagrams"
-  }
+  },
+  "hash_follow_up": {
+    "status": "UPSTREAM_REPLACEMENT_VALIDATED",
+    "old_branch": "fix/symcrypto-sha256-descriptor-and-padding",
+    "old_patch_cherry_picked": false,
+    "upstream_pr": "https://github.com/SiliconLabsSoftware/renode-infrastructure/pull/2",
+    "pr_merged": false,
+    "upstream_maintainer_confirmed_fixed_in_26q3": true,
+    "descriptor_regressions_passed": 6,
+    "original_sdk_probe_replayed": false,
+    "consumer_report": "renode/tests/peripherals/SiLabs/symcrypto_hash_validation_20261102.json"
+  },
+  "all_historical_local_changes_migrated": false,
+  "remaining_inventory": "renode/SILABS_MIGRATION_INVENTORY.json (51 overlay-related files, 17 unique C# workspace variants inventoried; not a completed semantic review)"
 }

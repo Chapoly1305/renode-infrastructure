@@ -312,10 +312,10 @@ namespace Antmicro.Renode.Peripherals.UART
             else
             {
                 TransmitCharacter(data);
-                txBufferLevelInterrupt.Value = true;
-                txCompleteInterrupt.Value = true;
-                UpdateInterrupts();
             }
+            txBufferLevelInterrupt.Value = true;
+            txCompleteInterrupt.Value = true;
+            UpdateInterrupts();
             transferCompleteFlag.Value = true;
         }
 

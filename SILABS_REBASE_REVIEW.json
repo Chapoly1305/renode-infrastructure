@@ -22,10 +22,15 @@
     "SYSRTC1_regression_tests": 2,
     "board_and_bridge_load_reset": "PASS",
     "pending": [
-      "firmware commissioning, Thread attach and operational Invoke/Read",
       "shadow-register and Storage0 compensation relevance",
       "physical mailbox/scheduler fidelity fix to replace opt-in acknowledgement compensation"
-    ]
+    ],
+    "stock_full_commissioning": {
+      "Ltech": "PASS: native UDP CASE, CommissioningComplete and Read/Toggle/Read with state change",
+      "LG": "PASS with explicit MG24A profile",
+      "Quectel": "ThreadNetworkEnable timeout reproduced on candidate and old deployed runtime",
+      "consumer_report": "tests/peripherals/SiLabs/stock_e2e_validation_20261103.json"
+    }
   },
   "commits": [
     {
@@ -253,6 +258,7 @@
     "EUSART4_tests_passed": 4,
     "EUSART4_upstream_robot_passed": 10,
     "real_Ltech_PASE": "PASS",
-    "full_commissioning": "NOT_VALIDATED"
+    "full_commissioning": "Ltech and LG PASS with all host tools built from source; bundled image Ltech FULL_PASS",
+    "source_archive_limit": "Source snapshots preserve lab commits and working files. This does not establish exact old DLL build provenance."
   }
 }

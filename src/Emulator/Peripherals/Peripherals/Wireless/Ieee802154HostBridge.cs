@@ -45,7 +45,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                                     string group = "224.0.0.116", string localAddress = "127.0.0.1", bool verbose = false)
         {
             this.machine = machine;
-            this.Channel = channel;
+            this.ThreadChannel = channel;
             this.nodeId = nodeId;
             this.portBase = portBase;
             this.groupAddress = IPAddress.Parse(group);
@@ -69,7 +69,26 @@ namespace Antmicro.Renode.Peripherals.Wireless
         {
         }
 
-        public int Channel { get; set; }
+        // IRadio.Channel is a physical RF routing key in 10 kHz units in 26q3.
+        // OT-sim datagrams still carry the IEEE channel number (11..26).
+        public int Channel
+        {
+            get => (2405 + 5 * (ThreadChannel - 11)) * 100;
+            set { }
+        }
+
+        public int ThreadChannel
+        {
+            get => threadChannel;
+            set
+            {
+                if(value < 11 || value > 26)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(value), "2.4 GHz IEEE 802.15.4 channel must be 11..26");
+                }
+                threadChannel = value;
+            }
+        }
 
         public event Action<IRadio, byte[]> FrameSent;
 
@@ -112,7 +131,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 learnedSync = new byte[n];
                 Array.Copy(frame, 0, learnedSync, 0, n);
                 this.Log(LogLevel.Warning, "Ieee802154HostBridge: learned {0}-byte 802.15.4 sync word {1} (channel {2})",
-                         n, BitConverter.ToString(learnedSync), Channel);
+                         n, BitConverter.ToString(learnedSync), ThreadChannel);
             }
 
             // The bridge synthesizes MAC ACKs locally (see the ack-request handling below and in HostRxLoop),
@@ -129,7 +148,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             if(verbose)
             {
                 this.Log(LogLevel.Warning, "Ieee802154HostBridge: device->host MPDU ({0} B, ch{1}): {2}",
-                         mpdu.Length, Channel, BitConverter.ToString(mpdu));
+                         mpdu.Length, ThreadChannel, BitConverter.ToString(mpdu));
             }
 
             // FrameSent fires at the device's TX START, but a real receiver only holds the frame once it is
@@ -222,7 +241,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             if(verbose)
             {
                 this.Log(LogLevel.Warning, "Ieee802154HostBridge: host->device MPDU ({0} B, ch{1}): {2}",
-                         mpdu.Length, Channel, BitConverter.ToString(mpdu));
+                         mpdu.Length, ThreadChannel, BitConverter.ToString(mpdu));
             }
 
             // Register in the shared InterferenceQueue BEFORE raising FrameSent (the receiver drops frames
@@ -367,7 +386,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 groupEndpoint = new IPEndPoint(groupAddress, portBase);
 
                 this.Log(LogLevel.Warning, "Ieee802154HostBridge: joined OT-sim air {0}:{1} as node {2} (tx port {3}), channel {4}",
-                         groupAddress, portBase, nodeId, portBase + nodeId, Channel);
+                         groupAddress, portBase, nodeId, portBase + nodeId, ThreadChannel);
             }
             catch(Exception e)
             {
@@ -424,7 +443,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 Array.Copy(buffer, 1, mpdu, 0, len - 1);
 
                 // Frame carries the sender's channel; only inject frames on the channel the device is using.
-                if(channel != Channel)
+                if(channel != ThreadChannel)
                 {
                     continue;
                 }
@@ -467,7 +486,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             try
             {
                 var datagram = new byte[1 + mpdu.Length];
-                datagram[0] = (byte)Channel;
+                datagram[0] = (byte)ThreadChannel;
                 Array.Copy(mpdu, 0, datagram, 1, mpdu.Length);
                 // Called both from the emulation thread (relaying device frames) and the host RX thread
                 // (synthesizing prompt ACKs back to the host), so serialize the sends.
@@ -536,6 +555,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         }
 
         private readonly IMachine machine;
+        private int threadChannel;
         private readonly int nodeId;
         private readonly int portBase;
         private readonly IPAddress groupAddress;

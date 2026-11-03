@@ -36,8 +36,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
             this.machine = machine;
             this.port = port;
             // BLE primary advertising channels are 37/38/39; in this radio model's channel numbering those
-            // are 0 (2402 MHz), 12 (2426 MHz) and 39 (2480 MHz). Scan on 37 by default.
-            Channel = 0;
+            // are 240200, 242600 and 248000 in the 26q3 medium's 10 kHz RF keys.
+            // Scan on BLE advertising channel 37 (2402 MHz) by default.
+            Channel = AdvertisingChannel37;
             StartHostSocket();
         }
 
@@ -45,6 +46,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         {
             state = State.Scanning;
             connectIndScheduled = false;
+            Channel = AdvertisingChannel37;
         }
 
         public uint ReadDoubleWord(long offset)
@@ -153,7 +155,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 return;
             }
 
-            Channel = DataChannelToRf(NextDataChannel());
+            Channel = AdvertisingChannel37 + 200 * DataChannelToRf(NextDataChannel());
 
             int llid;
             byte[] payload;
@@ -801,6 +803,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private const ulong ConnIntervalMicroseconds = 30000;
 
         // Connection parameters advertised in the CONNECT_IND LLData.
+        private const int AdvertisingChannel37 = 240200; // RF center frequency / 10 kHz
         private const uint ConnectionAccessAddress = 0xAF9AB135; // a valid (non-adv) connection access address
         private const byte WinSize = 0x02;                       // transmit window size (x1.25ms)
         private const ushort ConnInterval = 0x0018;              // 24 * 1.25ms = 30ms

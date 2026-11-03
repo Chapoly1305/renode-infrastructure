@@ -235,6 +235,93 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private const int RAC_Storage0SpinThreshold = 128;          // identical both-flags reads => confirmed spin
         private uint racStorage0LastRead;
         private int racStorage0SpinCount;
+
+        // Opt-in compatibility with the deployed stock-firmware harness. This
+        // acknowledges a host doorbell while both CPUs are masked: a simulation
+        // compensation, NOT hardware mailbox behaviour. Do not use for IRQ or
+        // timing fidelity measurements. The stock Matter scenario opts in explicitly.
+        public bool HostMailboxDoorbellCompensationEnabled
+        {
+            get => hostMailboxDoorbellCompensationEnabled;
+            set
+            {
+                hostMailboxDoorbellCompensationEnabled = value;
+                ResetHostMailboxPollStreak();
+            }
+        }
+
+        public ulong HostMailboxDoorbellCompensationCount { get; private set; }
+
+        private void ResetHostMailboxPollStreak()
+        {
+            hostMailboxDoorbellSpinCount = 0;
+            hostMailboxDoorbellLastRead = 0;
+        }
+
+        private uint CompensateHostMailboxPolling(long offset, uint value)
+        {
+            if(!HostMailboxDoorbellCompensationEnabled
+                || (offset & 0xFFF) != (long)HostMailboxRegisters.InterruptFlags
+                || !machine.SystemBus.TryGetCurrentCPU(out var readingCpu)
+                || readingCpu != sequencer)
+            {
+                return value;
+            }
+
+            uint pendingHost = 0;
+            bool pendingRadio = false;
+            for(var i = 0; i < MailboxMessageNumber; i++)
+            {
+                if(HOSTMAILBOX_messageInterrupt[i].Value && HOSTMAILBOX_messageInterruptEnable[i].Value)
+                {
+                    pendingHost |= 1u << i;
+                }
+                pendingRadio |= RFMAILBOX_messageInterrupt[i].Value && RFMAILBOX_messageInterruptEnable[i].Value;
+            }
+            if(pendingHost == 0 || !pendingRadio)
+            {
+                ResetHostMailboxPollStreak();
+                return value;
+            }
+            if(value != hostMailboxDoorbellLastRead)
+            {
+                hostMailboxDoorbellLastRead = value;
+                hostMailboxDoorbellSpinCount = 0;
+            }
+            if(++hostMailboxDoorbellSpinCount < HostMailboxDoorbellSpinThreshold)
+            {
+                return value;
+            }
+            ResetHostMailboxPollStreak();
+
+            var host = machine.GetPeripheralsOfType<CortexM>().FirstOrDefault(cpu => cpu != sequencer);
+            if(host == null || host.PRIMASK.RawValue == 0 || sequencer.PRIMASK.RawValue == 0)
+            {
+                return value;
+            }
+
+            // Preserve unrelated flags and all message pointers. Monitor and host
+            // reads never enter this path, and disabled flags cannot be acknowledged.
+            for(var i = 0; i < MailboxMessageNumber; i++)
+            {
+                if((pendingHost & (1u << i)) != 0)
+                {
+                    HOSTMAILBOX_messageInterrupt[i].Value = false;
+                }
+            }
+            HostMailboxDoorbellCompensationCount++;
+            this.Log(LogLevel.Warning,
+                "HOSTMAILBOX COMPENSATION: acknowledging pending host doorbell 0x{0:X} after {1} sequencer polls with both CPUs masked (count={2}); not a hardware IRQ acknowledgement",
+                pendingHost, HostMailboxDoorbellSpinThreshold, HostMailboxDoorbellCompensationCount);
+            UpdateInterrupts();
+            return value & ~pendingHost;
+        }
+
+        private const int HostMailboxDoorbellSpinThreshold = 16384;
+        private bool hostMailboxDoorbellCompensationEnabled;
+        private uint hostMailboxDoorbellLastRead;
+        private int hostMailboxDoorbellSpinCount;
+
         private uint BreakStorageMailboxDeadlock(long offset, uint value)
         {
             if((offset & 0xFFF) != (long)RadioControllerRegisters.Storage0)
@@ -319,6 +406,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("rfmailbox")]
         public void WriteDoubleWordToRadioMailbox(long offset, uint value)
         {
+            ResetHostMailboxPollStreak();
             Write<RadioMailboxRegisters>(radioMailboxRegistersCollection, "Radio Mailbox (RFMAILBOX)", offset, value);
         }
 
@@ -343,6 +431,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("hostmailbox_ns")]
         public void WriteDoubleWordToHostMailboxNonSecure(long offset, uint value)
         {
+            ResetHostMailboxPollStreak();
             Write<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX_NS)", offset, value);
         }
 
@@ -367,6 +456,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("hostmailbox")]
         public void WriteDoubleWordToHostMailbox(long offset, uint value)
         {
+            ResetHostMailboxPollStreak();
             Write<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX)", offset, value);
         }
 
@@ -379,7 +469,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("hostmailbox")]
         public uint ReadDoubleWordFromHostMailbox(long offset)
         {
-            return Read<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX)", offset);
+            var value = Read<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX)", offset);
+            return CompensateHostMailboxPolling(offset, value);
         }
 
         [ConnectionRegionAttribute("rfmailbox_ns")]
@@ -391,6 +482,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("rfmailbox_ns")]
         public void WriteDoubleWordToRadioMailboxNonSecure(long offset, uint value)
         {
+            ResetHostMailboxPollStreak();
             Write<RadioMailboxRegisters>(radioMailboxRegistersCollection, "Radio Mailbox (RFMAILBOX_NS)", offset, value);
         }
 
@@ -403,7 +495,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         [ConnectionRegionAttribute("hostmailbox_ns")]
         public uint ReadDoubleWordFromHostMailboxNonSecure(long offset)
         {
-            return Read<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX_NS)", offset);
+            var value = Read<HostMailboxRegisters>(hostMailboxRegistersCollection, "Host Mailbox (HOSTMAILBOX_NS)", offset);
+            return CompensateHostMailboxPolling(offset, value);
         }
 
         [ConnectionRegionAttribute("synth_ns")]
@@ -648,6 +741,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         public void Reset()
         {
+            ResetHostMailboxPollStreak();
+            HostMailboxDoorbellCompensationCount = 0;
             // Reset frame and channel variables
             currentFrame = null;
             currentFrameOffset = 0;

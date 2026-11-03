@@ -1,7 +1,7 @@
 {
   "baseline": "3bfa03fafad9fb70dd705b65f2e435c0bbde4de1",
   "branch": "integration/stock-ble-on-silabs-26q3",
-  "promotion_status": "BOOT_TO_GATT_PASS_WITH_EXPLICIT_COMPENSATION_PENDING_COMMISSIONING",
+  "promotion_status": "FULL_STOCK_E2E_PASSED_RF_RESET_REPLAY_PENDING",
   "expanded_regression": {
     "component_checks_passed": 79,
     "board_load_reset": "PASS",
@@ -22,15 +22,17 @@
     "SYSRTC1_regression_tests": 2,
     "board_and_bridge_load_reset": "PASS",
     "pending": [
-      "shadow-register and Storage0 compensation relevance",
-      "physical mailbox/scheduler fidelity fix to replace opt-in acknowledgement compensation"
+      "Final packet replay after RF shadow/Storage0 reset correction"
     ],
     "stock_full_commissioning": {
       "Ltech": "PASS: native UDP CASE, CommissioningComplete and Read/Toggle/Read with state change",
       "LG": "PASS with explicit MG24A profile",
       "Quectel": "ThreadNetworkEnable timeout reproduced on candidate and old deployed runtime",
       "consumer_report": "tests/peripherals/SiLabs/stock_e2e_validation_20261103.json"
-    }
+    },
+    "physical_model_limits": [
+      "Hostmailbox/Storage0 and local ACK compensation are retained simulation behavior, not physical IRQ/timing fidelity."
+    ]
   },
   "commits": [
     {
@@ -119,7 +121,6 @@
   ],
   "not_included": [
     "Sibling hash patch not cherry-picked: inherited 26q3 implementation now passes six equivalent descriptor regressions; see hash_follow_up",
-    "MG21 platform/DeviceFamily/HFXO changes pending; its Thumb-2 tlib fix is now separately ported above.",
     "Private provision-page bytes remain in the original corpus; compatibility/diagnostic overlays are explicit consumer profiles."
   ],
   "tlib": {
@@ -166,7 +167,7 @@
     "consumer_report": "renode/tests/peripherals/SiLabs/symcrypto_hash_validation_20261102.json"
   },
   "all_historical_local_changes_migrated": false,
-  "remaining_inventory": "renode/SILABS_MIGRATION_INVENTORY.json: 51 overlay-related files and 17 C# workspace variants have explicit source dispositions; full deployed-runtime equivalence, vendor commissioning/host tooling and remaining platform work are incomplete.",
+  "remaining_inventory": "Retained source changes and explicit exclusions are inventoried. Legacy physical timing/vendor limits and exact old DLL provenance remain documented; final RF-reset packet replay and consumer artifact backup are pending.",
   "additional_local_models": [
     {
       "commit": "3fd5c2d5",
@@ -242,7 +243,7 @@
     "patch_and_baseline_git_blob": "a395643f069c382ab21c1f6808f0a2bf57ac8269",
     "named_thread_recreation_cases_passed": 3
   },
-  "latest_consumer_checkpoint": "renode/tests/peripherals/SiLabs/overlay_migration_validation_20261102.json",
+  "latest_consumer_checkpoint": "renode/tests/peripherals/SiLabs/stock_e2e_validation_20261103.json",
   "lab_recovery": {
     "model_code_commit": "32dd8806a8b5186d33175fa0789689b297e9c623",
     "archive_branch": "archive/lab-runtime-20261103",
@@ -260,5 +261,13 @@
     "real_Ltech_PASE": "PASS",
     "full_commissioning": "Ltech and LG PASS with all host tools built from source; bundled image Ltech FULL_PASS",
     "source_archive_limit": "Source snapshots preserve lab commits and working files. This does not establish exact old DLL build provenance."
+  },
+  "rf_reset_follow_up": {
+    "model_code_commit": "239558d5",
+    "baseline_methods": 6,
+    "baseline_failures": 3,
+    "corrected_methods_passed": 6,
+    "hostmailbox_control_methods_passed": 10,
+    "scope": "RF shadow fallback reset defaults, discard unknown writes, modeled read-only priority, shared aliases and Storage0 streak reset. No silicon fidelity claim."
   }
 }

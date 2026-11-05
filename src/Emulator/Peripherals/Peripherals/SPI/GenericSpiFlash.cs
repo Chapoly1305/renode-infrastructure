@@ -193,14 +193,15 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         protected virtual byte ReadFromMemory()
         {
-            var memoryAddress = (long)currentOperation.ExecutionAddress + currentOperation.CommandBytesHandled;
-            memoryAddress |= (uint)extendedAddressRegister.Read() << 24;
-            if(memoryAddress > underlyingMemory.Size)
+            var startAddress = GetOperationAddress();
+            if(startAddress >= underlyingMemory.Size)
             {
-                this.Log(LogLevel.Error, "Cannot read from address 0x{0:X} because it is bigger than configured memory size.", currentOperation.ExecutionAddress);
+                this.Log(LogLevel.Error, "Cannot read from address 0x{0:X} because it is outside configured memory size.", startAddress);
                 return 0;
             }
 
+            // Sequential reads wrap around the whole array, including across an EAR segment boundary.
+            var memoryAddress = (startAddress + currentOperation.CommandBytesHandled) % underlyingMemory.Size;
             return underlyingMemory.ReadByte(memoryAddress);
         }
 
@@ -210,15 +211,16 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 return;
             }
-            underlyingMemory.WriteByte(position, val);
+            // NOR page programming can only clear bits; an erase restores them to one.
+            underlyingMemory.WriteByte(position, (byte)(underlyingMemory.ReadByte(position) & val));
         }
 
         protected bool TryVerifyWriteToMemory(out long position)
         {
-            position = currentOperation.ExecutionAddress + currentOperation.CommandBytesHandled;
-            if(position > underlyingMemory.Size)
+            position = GetOperationAddress() + currentOperation.CommandBytesHandled;
+            if(position >= underlyingMemory.Size)
             {
-                this.Log(LogLevel.Error, "Cannot write to address 0x{0:X} because it is bigger than configured memory size.", currentOperation.ExecutionAddress);
+                this.Log(LogLevel.Error, "Cannot write to address 0x{0:X} because it is outside configured memory size.", position);
                 return false;
             }
             if(lockedRange.HasValue && lockedRange.Value.Contains((ulong)position))
@@ -227,6 +229,13 @@ namespace Antmicro.Renode.Peripherals.SPI
                 return false;
             }
             return true;
+        }
+
+        private long GetOperationAddress()
+        {
+            var address = (long)currentOperation.ExecutionAddress;
+            // The EAR supplies the high address byte only for three-byte commands.
+            return currentOperation.AddressLength == 3 ? address | ((long)extendedAddressRegister.Read() << 24) : address;
         }
 
         protected virtual byte GetCapacityCode()
@@ -658,21 +667,22 @@ namespace Antmicro.Renode.Peripherals.SPI
             case DecodedOperation.OperationType.Erase:
                 if(enable.Value)
                 {
-                    if(currentOperation.ExecutionAddress >= underlyingMemory.Size)
+                    var eraseAddress = GetOperationAddress();
+                    if(eraseAddress >= underlyingMemory.Size)
                     {
-                        this.Log(LogLevel.Error, "Cannot erase memory because current address 0x{0:X} exceeds configured memory size.", currentOperation.ExecutionAddress);
+                        this.Log(LogLevel.Error, "Cannot erase memory because current address 0x{0:X} exceeds configured memory size.", eraseAddress);
                         return;
                     }
                     switch(currentOperation.EraseSize)
                     {
                     case DecodedOperation.OperationEraseSize.Subsector4K:
-                        EraseSegment(4.KB());
+                        EraseSegment(4.KB(), eraseAddress);
                         break;
                     case DecodedOperation.OperationEraseSize.Subsector32K:
-                        EraseSegment(32.KB());
+                        EraseSegment(32.KB(), eraseAddress);
                         break;
                     case DecodedOperation.OperationEraseSize.Sector:
-                        EraseSegment(sectorSize);
+                        EraseSegment(sectorSize, eraseAddress);
                         break;
                     case DecodedOperation.OperationEraseSize.Die:
                         EraseDie();
@@ -722,11 +732,11 @@ namespace Antmicro.Renode.Peripherals.SPI
             underlyingMemory.WriteBytes((long)range.StartAddress, segment);
         }
 
-        private void EraseSegment(int segmentSize)
+        private void EraseSegment(int segmentSize, long eraseAddress)
         {
             // The documentations states that on erase the operation address is
             // aligned to the segment size
-            var position = segmentSize * (currentOperation.ExecutionAddress / segmentSize);
+            var position = eraseAddress / segmentSize * segmentSize;
             var segmentToErase = new Range((ulong)position, (ulong)segmentSize);
             this.Log(LogLevel.Noisy, "Full segment to erase: {0}", segmentToErase);
             foreach(var subrange in lockedRange.HasValue ? segmentToErase.Subtract(lockedRange.Value) : new List<Range>() { segmentToErase })
